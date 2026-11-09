@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +18,10 @@ import (
 	"sphvideo/internal/inject"
 )
 
-const defaultPort = 20230
+const (
+	defaultPort = 20230
+	portTries   = 10
+)
 
 type Service struct {
 	mu       sync.Mutex
@@ -32,10 +36,40 @@ type Service struct {
 	version       string
 	saveDir       string
 	statusFn      func(string)
+
+	jobs      *download.Manager
+	startedAt time.Time
+	lastPing  time.Time
+	feedSeen  bool
+	lastJob   download.JobSnapshot
+	onJobDone func(download.JobSnapshot)
+	reveal    func(string) error
 }
 
 func New(saveDir string, status func(string)) *Service {
-	return &Service{saveDir: saveDir, statusFn: status}
+	s := &Service{saveDir: saveDir, statusFn: status, jobs: download.NewManager()}
+	s.jobs.SetOnDone(func(js download.JobSnapshot) {
+		s.mu.Lock()
+		s.lastJob = js
+		fn := s.onJobDone
+		s.mu.Unlock()
+		if fn != nil {
+			fn(js)
+		}
+	})
+	return s
+}
+
+func (s *Service) SetOnJobDone(fn func(download.JobSnapshot)) {
+	s.mu.Lock()
+	s.onJobDone = fn
+	s.mu.Unlock()
+}
+
+func (s *Service) SetReveal(fn func(string) error) {
+	s.mu.Lock()
+	s.reveal = fn
+	s.mu.Unlock()
 }
 
 func (s *Service) setStatus(msg string) {
@@ -61,13 +95,12 @@ func (s *Service) Start() error {
 	}
 	s.mu.Unlock()
 
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", defaultPort))
+	ln, port, err := listenLocal()
 	if err != nil {
-		return fmt.Errorf("端口 %d 被占用，请关闭占用它的程序后重试", defaultPort)
+		return err
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
 	// A proxy pointing here at startup is left over from a crashed run.
-	clearStaleProxy(port)
+	clearStaleProxyRange()
 
 	snap, err := snapshotProxy()
 	if err != nil {
@@ -123,11 +156,20 @@ func (s *Service) Start() error {
 	e.AddPlugin(s.resPlugin())
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/__sph/download" {
+		switch r.URL.Path {
+		case "/__sph/download":
 			s.handleDownload(w, r)
-			return
+		case "/__sph/job":
+			s.handleJob(w, r)
+		case "/__sph/cancel":
+			s.handleCancel(w, r)
+		case "/__sph/reveal":
+			s.handleReveal(w, r)
+		case "/__sph/ping":
+			s.handlePing(w, r)
+		default:
+			e.ServeHTTP(w, r)
 		}
-		e.ServeHTTP(w, r)
 	})
 	server := &http.Server{Handler: handler}
 	s.mu.Lock()
@@ -145,15 +187,16 @@ func (s *Service) Start() error {
 	}
 	s.mu.Lock()
 	s.wdIn = wd
+	s.running = true
+	s.startedAt = time.Now()
+	s.lastPing = time.Time{}
+	s.feedSeen = false
 	s.mu.Unlock()
 	go func() {
 		_ = server.Serve(ln)
 	}()
 
-	s.mu.Lock()
-	s.running = true
-	s.mu.Unlock()
-	s.setStatus(fmt.Sprintf("已启动（127.0.0.1:%d），请打开微信视频号", port))
+	s.setStatus("")
 	return nil
 }
 
@@ -172,7 +215,12 @@ func (s *Service) Stop() {
 	s.echo = nil
 	s.wdIn = nil
 	s.running = false
+	s.startedAt = time.Time{}
+	s.lastPing = time.Time{}
+	s.feedSeen = false
 	s.mu.Unlock()
+
+	s.jobs.CancelAll()
 
 	// Restore the user's proxy first, so the network is usable immediately.
 	if snap != nil {
@@ -195,7 +243,36 @@ func (s *Service) Stop() {
 		// On a failed CA removal, closing without "done" lets the watchdog retry.
 		_ = wd.Close()
 	}
-	s.setStatus("已停止，代理和证书已恢复")
+	if caErr != nil {
+		s.setStatus("已停止，但临时证书清理失败。请在「说明」里点「修复网络」。")
+		return
+	}
+	s.setStatus("已停止")
+}
+
+type Info struct {
+	Running   bool
+	Port      int
+	StartedAt time.Time
+	LastPing  time.Time
+	FeedSeen  bool
+	Active    []download.JobSnapshot
+	Last      download.JobSnapshot
+}
+
+func (s *Service) Info() Info {
+	s.mu.Lock()
+	info := Info{
+		Running:   s.running,
+		Port:      s.port,
+		StartedAt: s.startedAt,
+		LastPing:  s.lastPing,
+		FeedSeen:  s.feedSeen,
+		Last:      s.lastJob,
+	}
+	s.mu.Unlock()
+	info.Active = s.jobs.Active()
+	return info
 }
 
 func (s *Service) channelsPlugin() *echo.Plugin {
@@ -241,13 +318,16 @@ func (s *Service) resPlugin() *echo.Plugin {
 }
 
 type downloadResponse struct {
-	OK    bool   `json:"ok"`
-	Path  string `json:"path,omitempty"`
-	Error string `json:"error,omitempty"`
+	OK    bool                  `json:"ok"`
+	ID    string                `json:"id,omitempty"`
+	Path  string                `json:"path,omitempty"`
+	Error string                `json:"error,omitempty"`
+	Job   *download.JobSnapshot `json:"job,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
@@ -255,10 +335,15 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 func cors(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("Access-Control-Allow-Origin", "*")
-	h.Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	h.Set("Access-Control-Allow-Headers", "Content-Type")
 	h.Set("Access-Control-Allow-Private-Network", "true")
 	h.Set("Access-Control-Max-Age", "600")
+}
+
+func allowedOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	return origin == "" || origin == "https://channels.weixin.qq.com"
 }
 
 func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -271,24 +356,177 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, downloadResponse{Error: "POST only"})
 		return
 	}
-	if origin := r.Header.Get("Origin"); origin != "" && origin != "https://channels.weixin.qq.com" {
+	if !allowedOrigin(r) {
 		writeJSON(w, http.StatusForbidden, downloadResponse{Error: "forbidden"})
 		return
 	}
 	var req download.Request
 	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 	if err := dec.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, downloadResponse{Error: "bad request"})
+		writeJSON(w, http.StatusBadRequest, downloadResponse{Error: "请求无效"})
+		return
+	}
+	switch strings.TrimSpace(req.Kind) {
+	case "", "video", "cover", "images":
+	default:
+		writeJSON(w, http.StatusBadRequest, downloadResponse{Error: "不支持的下载类型"})
 		return
 	}
 	s.mu.Lock()
+	running := s.running
 	dir := s.saveDir
 	snap := s.proxySnapshot
 	s.mu.Unlock()
-	path, err := download.Save(req, dir, downloadProxy(snap), s.setStatus)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, downloadResponse{Error: err.Error()})
+	if !running {
+		writeJSON(w, http.StatusConflict, downloadResponse{Error: "下载服务已停止，请回到软件窗口点「启动」"})
 		return
 	}
-	writeJSON(w, http.StatusOK, downloadResponse{OK: true, Path: path})
+	job := s.jobs.Start(req, dir, downloadProxy(snap))
+	writeJSON(w, http.StatusOK, downloadResponse{OK: true, ID: job.ID})
+}
+
+func (s *Service) handleJob(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, downloadResponse{Error: "GET only"})
+		return
+	}
+	if !allowedOrigin(r) {
+		writeJSON(w, http.StatusForbidden, downloadResponse{Error: "forbidden"})
+		return
+	}
+	snap, ok := s.jobs.Get(r.URL.Query().Get("id"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, downloadResponse{Error: "下载任务不存在"})
+		return
+	}
+	writeJSON(w, http.StatusOK, downloadResponse{OK: true, Job: &snap})
+}
+
+func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, downloadResponse{Error: "POST only"})
+		return
+	}
+	if !allowedOrigin(r) {
+		writeJSON(w, http.StatusForbidden, downloadResponse{Error: "forbidden"})
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, downloadResponse{Error: "请求无效"})
+		return
+	}
+	if !s.jobs.Cancel(req.ID) {
+		writeJSON(w, http.StatusConflict, downloadResponse{Error: "下载已经结束"})
+		return
+	}
+	writeJSON(w, http.StatusOK, downloadResponse{OK: true})
+}
+
+func (s *Service) handleReveal(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, downloadResponse{Error: "POST only"})
+		return
+	}
+	if !allowedOrigin(r) {
+		writeJSON(w, http.StatusForbidden, downloadResponse{Error: "forbidden"})
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, downloadResponse{Error: "请求无效"})
+		return
+	}
+	snap, ok := s.jobs.Get(req.ID)
+	if !ok || snap.State != download.JobDone || snap.Path == "" {
+		writeJSON(w, http.StatusNotFound, downloadResponse{Error: "没有可打开的文件"})
+		return
+	}
+	s.mu.Lock()
+	dir, reveal := s.saveDir, s.reveal
+	s.mu.Unlock()
+	if !withinDir(dir, snap.Path) {
+		writeJSON(w, http.StatusForbidden, downloadResponse{Error: "forbidden"})
+		return
+	}
+	if reveal == nil {
+		writeJSON(w, http.StatusInternalServerError, downloadResponse{Error: "无法打开文件夹"})
+		return
+	}
+	if err := reveal(snap.Path); err != nil {
+		writeJSON(w, http.StatusInternalServerError, downloadResponse{Error: "无法打开文件夹"})
+		return
+	}
+	writeJSON(w, http.StatusOK, downloadResponse{OK: true, Path: snap.Path})
+}
+
+func (s *Service) handlePing(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, downloadResponse{Error: "GET only"})
+		return
+	}
+	if !allowedOrigin(r) {
+		writeJSON(w, http.StatusForbidden, downloadResponse{Error: "forbidden"})
+		return
+	}
+	s.mu.Lock()
+	s.lastPing = time.Now()
+	s.feedSeen = r.URL.Query().Get("feed") == "1"
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, downloadResponse{OK: true})
+}
+
+func withinDir(dir, path string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func listenLocal() (net.Listener, int, error) {
+	for port := defaultPort; port < defaultPort+portTries; port++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			return ln, port, nil
+		}
+	}
+	return nil, 0, fmt.Errorf("本地端口被占用，请重启电脑后再试")
+}
+
+func clearStaleProxyRange() {
+	for port := defaultPort; port < defaultPort+portTries; port++ {
+		clearStaleProxy(port)
+	}
+}
+
+// Repair restores the proxy and removes the temporary CA after a crash, or
+// when the user's network is broken after closing the app.
+func Repair() error {
+	clearStaleProxyRange()
+	return removeCA()
 }

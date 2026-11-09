@@ -1,38 +1,102 @@
 package app
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
+	"sphvideo/internal/download"
 	"sphvideo/internal/proxy"
 )
 
 type State struct {
 	svc *proxy.Service
+	win *mygo.Window
 
-	mu        sync.Mutex
-	status    string
-	saveDir   string
-	running   bool
-	starting  bool
-	lastPulse time.Time
+	mu           sync.Mutex
+	status       string
+	saveDir      string
+	running      bool
+	starting     bool
+	stopping     bool
+	repairing    bool
+	hiddenNotice bool
+	lastResult   string
+	lastPulse    time.Time
+
+	advancedOpen bool
 }
 
 func New() *State {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, "Downloads", "视频号")
-	s := &State{status: "未启动", saveDir: dir}
-	s.svc = proxy.New(dir, s.setStatus)
+	def := defaultSaveDir()
+	s := &State{saveDir: loadSaveDir(def)}
+	s.svc = proxy.New(s.saveDir, s.setStatus)
+	s.svc.SetOnJobDone(s.onJobDone)
+	s.svc.SetReveal(func(path string) error {
+		mygo.Shell.ShowItemInFolder(path)
+		return nil
+	})
 	return s
+}
+
+func (s *State) AttachWindow(w *mygo.Window) {
+	s.mu.Lock()
+	s.win = w
+	s.mu.Unlock()
+}
+
+func (s *State) windowFocused() bool {
+	s.mu.Lock()
+	w := s.win
+	s.mu.Unlock()
+	return w != nil && w.IsFocused()
 }
 
 func (s *State) Stop() {
 	s.svc.Stop()
+}
+
+func (s *State) ActiveDownloads() int {
+	return len(s.svc.Info().Active)
+}
+
+func (s *State) Toggle() {
+	s.toggle()
+}
+
+func (s *State) StopFromTray() {
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
+	if running {
+		s.toggle()
+	}
+}
+
+func (s *State) RepairFromTray() {
+	s.repair()
+}
+
+func (s *State) NotifyHidden() {
+	s.mu.Lock()
+	first := !s.hiddenNotice
+	s.hiddenNotice = true
+	s.mu.Unlock()
+	if !first {
+		return
+	}
+	note := mygo.NewNotification(mygo.NotificationOptions{
+		Title: "仍在后台运行",
+		Body:  "下载服务保持开启。在托盘菜单里选择「显示窗口」可以重新打开。",
+	})
+	_ = note.Show()
 }
 
 func (s *State) setStatus(msg string) {
@@ -41,32 +105,35 @@ func (s *State) setStatus(msg string) {
 	s.mu.Unlock()
 }
 
-func (s *State) setSaveDir(dir string) {
-	s.mu.Lock()
-	s.saveDir = dir
-	s.mu.Unlock()
-	s.svc.SetSaveDir(dir)
-}
-
-func (s *State) snapshot() (status, dir string, running, starting bool) {
+func (s *State) snapshot() (status, dir string, running, starting, stopping, repairing bool, lastResult string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.status, s.saveDir, s.running, s.starting
+	return s.status, s.saveDir, s.running, s.starting, s.stopping, s.repairing, s.lastResult
 }
 
 func (s *State) toggle() {
 	s.mu.Lock()
-	if s.starting {
+	if s.starting || s.stopping {
 		s.mu.Unlock()
 		return
 	}
 	if s.running {
+		previous := s.status
+		s.stopping = true
 		s.status = "正在停止…"
 		s.mu.Unlock()
+		if !s.confirmCancelDownloads() {
+			s.mu.Lock()
+			s.stopping = false
+			s.status = previous
+			s.mu.Unlock()
+			return
+		}
 		go func() {
 			s.svc.Stop()
 			s.mu.Lock()
 			s.running = false
+			s.stopping = false
 			s.mu.Unlock()
 		}()
 		return
@@ -78,50 +145,156 @@ func (s *State) toggle() {
 	go func() {
 		err := s.svc.Start()
 		s.mu.Lock()
+		defer s.mu.Unlock()
 		s.starting = false
 		if err != nil {
-			s.status = "启动失败：" + err.Error()
 			s.running = false
-		} else {
-			s.running = true
+			s.status = "启动失败：" + friendlyStartError(err)
+			return
 		}
-		s.mu.Unlock()
+		s.running = true
 	}()
 }
 
+func (s *State) confirmCancelDownloads() bool {
+	n := len(s.svc.Info().Active)
+	if n == 0 {
+		return true
+	}
+	res, err := mygo.Dialog.Message(mygo.MessageOptions{
+		Type:               mygo.MessageWarning,
+		Title:              "停止会取消下载",
+		Message:            fmt.Sprintf("还有 %d 个文件正在下载。停止后网络设置会恢复，未完成的文件会被删除。", n),
+		Buttons:            []string{"停止并取消下载", "继续下载"},
+		DefaultButton:      1,
+		CancelButton:       1,
+		DestructiveButtons: []int{0},
+	})
+	if err != nil {
+		return false
+	}
+	return res.Button == 0
+}
+
+func (s *State) repair() {
+	s.mu.Lock()
+	if s.starting || s.stopping {
+		s.mu.Unlock()
+		return
+	}
+	running := s.running
+	s.mu.Unlock()
+	if running && !s.confirmCancelDownloads() {
+		return
+	}
+	s.mu.Lock()
+	s.starting = false
+	s.stopping = true
+	s.repairing = true
+	s.status = "正在恢复网络…"
+	s.mu.Unlock()
+
+	go func() {
+		s.svc.Stop()
+		err := proxy.Repair()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.running = false
+		s.starting = false
+		s.stopping = false
+		s.repairing = false
+		if err != nil {
+			s.status = "修复网络失败：" + err.Error()
+			return
+		}
+		s.status = "网络设置已恢复。"
+	}()
+}
+
+func (s *State) onJobDone(js download.JobSnapshot) {
+	s.mu.Lock()
+	switch js.State {
+	case download.JobDone:
+		s.lastResult = js.Path
+		s.status = ""
+	case download.JobError:
+		s.status = js.Error
+	case download.JobCanceled:
+		s.status = "下载已取消"
+	}
+	s.mu.Unlock()
+
+	if js.State != download.JobDone {
+		return
+	}
+	if s.windowFocused() {
+		return
+	}
+	note := mygo.NewNotification(mygo.NotificationOptions{
+		ID:    "sph-done-" + js.ID,
+		Title: "下载完成",
+		Body:  filepath.Base(js.Path),
+	})
+	note.OnClick(func() {
+		mygo.Shell.ShowItemInFolder(js.Path)
+	})
+	_ = note.Show()
+}
+
 func (s *State) View(c *ui.Context) {
-	status, dir, running, starting := s.snapshot()
+	status, dir, running, starting, stopping, repairing, lastResult := s.snapshot()
+	info := s.svc.Info()
 	t := c.Theme()
 
-	ui.Column(c).Fill().Center().Gap(14).Children(func() {
-		ui.Text(c, "视频号视频下载").FontSize(22).Bold()
-		label := "启动"
-		if running {
-			label = "停止"
-		}
-		if ui.PrimaryButton(c, label).Disabled(starting).Clicked() {
-			s.toggle()
-		}
-		ui.Text(c, status).FontSize(12).TextColor(t.TextMuted)
+	ui.Scroll(c).Fill().Children(func() {
+		ui.Column(c).Padding(24).Gap(12).MaxWidth(680).Children(func() {
+			ui.Text(c, "视频号视频下载").FontSize(22).Bold()
 
-		ui.Row(c).Gap(8).Children(func() {
-			ui.Text(c, "保存到："+dir).FontSize(11).TextColor(t.TextMuted)
-			if ui.Button(c, "选择目录").Clicked() {
-				paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
-					Title:       "选择保存目录",
-					DefaultPath: dir,
-					Directory:   true,
-				})
-				if err == nil && len(paths) > 0 {
-					s.setSaveDir(paths[0])
-				}
+			if !running && !starting && !stopping && !repairing {
+				s.viewIntro(c)
+			} else {
+				s.viewRunning(c, t, info, lastResult, starting, stopping, repairing)
 			}
+
+			ui.Divider(c)
+			s.viewSaveDir(c, t, dir)
+
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				label := "启动"
+				if starting {
+					label = "正在启动…"
+				} else if repairing {
+					label = "正在恢复…"
+				} else if stopping {
+					label = "正在停止…"
+				} else if running {
+					label = "停止"
+				}
+				if ui.PrimaryButton(c, label).Disabled(starting || stopping || repairing).Clicked() {
+					s.toggle()
+				}
+			})
+
+			if status != "" {
+				ui.Text(c, status).FontSize(12).TextColor(t.TextMuted).Wrap()
+			}
+
+			if running {
+				ui.Text(c, "可最小化；关闭窗口后在托盘继续运行。").
+					FontSize(11).TextColor(t.TextMuted).Wrap()
+			}
+
+			ui.Collapsible(c, "说明", &s.advancedOpen, func() {
+				s.viewAbout(c, t)
+			})
+
+			ui.Text(c, "非官方工具 · 仅用于个人备份 · "+version()).
+				FontSize(11).TextColor(t.TextMuted).Wrap()
 		})
-		ui.Text(c, "启动后打开微信 → 视频号 → 任意内容，右下角会出现下载面板。").FontSize(11).TextColor(t.TextMuted)
 	})
 
-	// Background start/stop changes state without an input event; pulse slowly
-	// so the window catches up.
+	// Background start, stop and download changes happen without an input
+	// event; pulse so the window catches up.
 	s.mu.Lock()
 	pulse := time.Since(s.lastPulse) > 500*time.Millisecond
 	if pulse {
@@ -131,4 +304,228 @@ func (s *State) View(c *ui.Context) {
 	if pulse {
 		c.Invalidate()
 	}
+}
+
+func (s *State) viewIntro(c *ui.Context) {
+	ui.Text(c, "点「启动」，然后打开电脑版微信 → 视频号。页面右下角会出现下载面板。").
+		FontSize(14).Wrap()
+}
+
+func (s *State) viewAbout(c *ui.Context, t *ui.Theme) {
+	ui.Text(c, "下载只保存在本机；代理只处理视频号相关流量，不读取聊天记录或其他网站，也不上传内容。").
+		FontSize(12).TextColor(t.TextMuted).Wrap().MaxWidth(600)
+	ui.Text(c, "使用期间会临时修改系统代理并安装临时证书；停止或退出后自动恢复、删除。").
+		FontSize(12).TextColor(t.TextMuted).Wrap().MaxWidth(600)
+	ui.Text(c, "公司网络或 VPN 下，可能暂时影响内网访问。安全软件询问联网时请选择允许。").
+		FontSize(12).TextColor(t.TextMuted).Wrap().MaxWidth(600)
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		if ui.Button(c, "修复网络").Clicked() {
+			s.repair()
+		}
+		ui.Text(c, "停止后无法上网时，点这里恢复。").
+			FontSize(11).TextColor(t.TextMuted)
+	})
+}
+
+func (s *State) viewRunning(c *ui.Context, t *ui.Theme, info proxy.Info, lastResult string, starting, stopping, repairing bool) {
+	label := "已就绪"
+	color := t.Success
+	if starting {
+		label = "正在启动…"
+		color = t.Warning
+	} else if repairing {
+		label = "正在恢复…"
+		color = t.Warning
+	} else if stopping {
+		label = "正在停止…"
+		color = t.Warning
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "●").FontSize(14).TextColor(color)
+		ui.Text(c, label).FontSize(16).Bold()
+	})
+
+	if starting {
+		ui.Text(c, "正在准备下载服务…").FontSize(13).TextColor(t.TextMuted).Wrap()
+	} else if repairing || stopping {
+		ui.Text(c, "正在恢复系统设置…").FontSize(13).TextColor(t.TextMuted).Wrap()
+	} else {
+		ui.Text(c, "打开电脑版微信 → 视频号，在页面右下角下载。").
+			FontSize(13).Wrap()
+
+		connected := !info.LastPing.IsZero() && time.Since(info.LastPing) < 15*time.Second
+		if !connected {
+			ui.Text(c, "等待视频号页面…如果微信已打开，请完全退出后重新打开。").
+				FontSize(12).TextColor(t.Warning).Wrap()
+		} else if !info.FeedSeen {
+			ui.Text(c, "等待视频内容…").FontSize(12).TextColor(t.TextMuted)
+		}
+	}
+
+	if len(info.Active) > 0 {
+		job := info.Active[0]
+		title := fmt.Sprintf("正在下载 %d 个文件", len(info.Active))
+		if len(info.Active) == 1 && job.Title != "" {
+			title = "正在下载：" + job.Title
+		}
+		ui.Text(c, title).FontSize(13).Bold().MaxWidth(520).SingleLine().Tooltip(title)
+		if job.Progress >= 0 {
+			ui.Progress(c, job.Progress).Width(520)
+		} else {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Spinner(c)
+				ui.Text(c, "准备中…").FontSize(12).TextColor(t.TextMuted)
+			})
+		}
+		if job.Detail != "" {
+			ui.Text(c, job.Detail).FontSize(11).TextColor(t.TextMuted)
+		}
+	} else if lastResult != "" {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "上次保存："+filepath.Base(lastResult)).
+				FontSize(12).TextColor(t.TextMuted).MaxWidth(420).SingleLine().Tooltip(lastResult)
+			if ui.Button(c, "打开文件夹").Clicked() {
+				mygo.Shell.ShowItemInFolder(lastResult)
+			}
+		})
+	}
+
+	if !info.StartedAt.IsZero() && time.Since(info.StartedAt) > 20*time.Hour {
+		ui.Text(c, "已连续运行 20 小时，建议停止后重新启动。").
+			FontSize(12).TextColor(t.Warning).Wrap()
+	}
+}
+
+func (s *State) viewSaveDir(c *ui.Context, t *ui.Theme, dir string) {
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "下载保存到").FontSize(12).TextColor(t.TextMuted)
+		ui.Text(c, dir).FontSize(12).MaxWidth(340).SingleLine().Tooltip(dir)
+		if ui.Button(c, "更改").Clicked() {
+			s.chooseDir(dir)
+		}
+		if ui.Button(c, "打开").Clicked() {
+			_ = os.MkdirAll(dir, 0o755)
+			_ = mygo.Shell.OpenPath(dir)
+		}
+	})
+}
+
+func (s *State) chooseDir(current string) {
+	paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+		Title:       "选择保存目录",
+		DefaultPath: current,
+		Directory:   true,
+	})
+	if err == nil && len(paths) > 0 {
+		s.setSaveDir(paths[0])
+	}
+}
+
+func (s *State) setSaveDir(dir string) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		s.setStatus("无法使用这个文件夹，请选择其他文件夹。")
+		return
+	}
+	if err := testWritable(dir); err != nil {
+		s.setStatus("这个文件夹无法写入，请选择其他文件夹。")
+		return
+	}
+	s.mu.Lock()
+	s.saveDir = dir
+	s.mu.Unlock()
+	s.svc.SetSaveDir(dir)
+	if err := saveSaveDir(dir); err != nil {
+		s.setStatus("已切换保存目录，但无法记住这个设置。")
+	}
+}
+
+func testWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".sphvideo-write-test-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	_ = f.Close()
+	return os.Remove(name)
+}
+
+func friendlyStartError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "端口"):
+		return "本地端口被占用，请重启电脑后再试。"
+	case strings.Contains(msg, "证书"):
+		return "无法安装临时证书。请允许系统的证书确认，或检查安全软件的拦截提示。"
+	case strings.Contains(msg, "代理"):
+		return "无法修改系统代理。请检查安全软件是否拦截本程序。"
+	case strings.Contains(msg, "守护"):
+		return "清理进程启动失败。请检查安全软件是否拦截本程序。"
+	}
+	return msg
+}
+
+func version() string {
+	return "v0.1.0" // Keep in sync with mygo.json.
+}
+
+func defaultSaveDir() string {
+	base := ""
+	if p, err := mygo.App.Path(mygo.PathDownloads); err == nil && p != "" {
+		base = p
+	}
+	if base == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			base = filepath.Join(home, "Downloads")
+		}
+	}
+	if base == "" {
+		base = "."
+	}
+	return filepath.Join(base, "视频号")
+}
+
+type savedSettings struct {
+	SaveDir string `json:"saveDir"`
+}
+
+func settingsFile() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "sphvideo", "settings.json")
+}
+
+func loadSaveDir(def string) string {
+	name := settingsFile()
+	if name == "" {
+		return def
+	}
+	raw, err := os.ReadFile(name)
+	if err != nil {
+		return def
+	}
+	var st savedSettings
+	if json.Unmarshal(raw, &st) != nil {
+		return def
+	}
+	if st.SaveDir == "" || !filepath.IsAbs(st.SaveDir) {
+		return def
+	}
+	return st.SaveDir
+}
+
+func saveSaveDir(dir string) error {
+	name := settingsFile()
+	if name == "" {
+		return fmt.Errorf("no config directory")
+	}
+	if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(savedSettings{SaveDir: dir})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(name, raw, 0o644)
 }
