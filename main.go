@@ -124,8 +124,8 @@ func (s *appState) view(c *ui.Context) {
 		ui.Text(c, "启动后打开微信 → 视频号 → 任意视频，右下角会出现下载按钮。").FontSize(11).TextColor(t.TextMuted)
 	})
 
-	// Background start/stop changes the state without an input event; keep a
-	// slow pulse so the window catches up.
+	// Background start/stop changes state without an input event; pulse slowly
+	// so the window catches up.
 	s.mu.Lock()
 	pulse := time.Since(s.lastPulse) > 500*time.Millisecond
 	if pulse {

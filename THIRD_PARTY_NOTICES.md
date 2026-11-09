@@ -1,32 +1,25 @@
 # Third-party notices
 
-This project is an independent implementation. It uses the following
-open-source software and public algorithms. Their licenses apply to the
-respective parts.
-
 ## MyGo
 
-- Project: https://github.com/egoist/mygo
-- License: MIT
+- https://github.com/egoist/mygo
+- MIT
 - Copyright (c) 2026 MyGo contributors
 
 ## Echo
 
-- Project: https://github.com/ltaoo/echo
-- License: MIT
+- https://github.com/ltaoo/echo
+- MIT
 - Copyright (c) 2026 ltaoo
 
-## wx_channels_download (reference implementation)
+## wx_channels_download
 
-- Project: https://github.com/ltaoo/wx_channels_download
-- License: MIT with the Commons Clause condition
+- https://github.com/ltaoo/wx_channels_download
+- MIT + Commons Clause
 - Copyright (c) 2025 ltaoo
+- Reference for the download method and parts of the injection/decryption logic.
 
-The published method and parts of the injection/decryption logic were used
-as a reference. This project is not the upstream project, is not affiliated
-with its author, and is not endorsed by its author.
-
-The reference project's license adds the Commons Clause condition:
+Commons Clause condition:
 
 > Without limiting other conditions in the License, the grant of rights
 > under the License will not include, and the License does not grant to
@@ -40,18 +33,15 @@ This project is free and non-commercial; it must not be sold.
 
 ## Icon
 
-The application icon is the site icon of the reference project
-(`https://ltaoo.github.io/wx_channels_download/favicon.png`), used only to
-identify this tool. Rights in the icon belong to its owner. Replace or remove
-it if the owner requests.
+Icon from https://ltaoo.github.io/wx_channels_download/favicon.png. Rights
+belong to its owner. Replace or remove it on request.
 
 ## ISAAC64
 
-The ISAAC64 pseudo-random number generator was designed by Bob Jenkins and
-released into the public domain. The decryption range and keystream usage
-follow publicly available material, including Hanson/WechatSphDecrypt.
+ISAAC64, by Bob Jenkins, is public domain. Decryption range and keystream
+usage follow public material, including Hanson/WechatSphDecrypt.
 
-## MIT license text
+## MIT license
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

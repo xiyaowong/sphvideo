@@ -7,8 +7,7 @@ import (
 	"os"
 )
 
-// ISAAC64 keystream, matching the Channels media decoder. The encrypted
-// region is the first 128 KiB of the file.
+// Media files encrypt their first 128 KiB with an ISAAC64 keystream.
 
 type randCtx64 struct {
 	randCnt uint64
@@ -147,7 +146,6 @@ func decryptBytes(data []byte, key uint64) {
 	}
 }
 
-// decryptFileInPlace rewrites the encrypted head of path.
 func decryptFileInPlace(path string, key uint64) error {
 	if key == 0 {
 		return nil

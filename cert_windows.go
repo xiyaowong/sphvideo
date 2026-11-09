@@ -116,7 +116,7 @@ func installCA(der []byte) error {
 }
 
 // removeCA deletes every certificate this program may have installed, including
-// ones left by an earlier run that ended before cleanup.
+// leftovers from a crashed run.
 func removeCA() error {
 	store, err := openRootStore()
 	if err != nil {

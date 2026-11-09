@@ -13,10 +13,9 @@ import (
 	"syscall"
 )
 
-// The watchdog is the same executable started with --watchdog. It holds the
-// proxy snapshot and the CA name, and restores both if the main process dies.
-// A normal stop sends "done" on stdin, so the watchdog exits without touching
-// anything.
+// The watchdog is this executable started with --watchdog. It holds the proxy
+// snapshot and CA name and restores both if the main process dies. A normal
+// stop sends "done" on stdin, so the watchdog exits untouched.
 
 type watchdogState struct {
 	EnableSet   bool   `json:"e"`

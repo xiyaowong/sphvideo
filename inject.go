@@ -25,12 +25,10 @@ var (
 	reHTMLScript = regexp.MustCompile(`(src|href)="([^"]+)\.js"`)
 )
 
-// scriptFor returns the page script with the local API port filled in.
 func scriptFor(port int) string {
 	return strings.ReplaceAll(injectJS, "__SPH_PORT__", fmt.Sprint(port))
 }
 
-// injectHTML adds the download script to the Channels page.
 func injectHTML(html string, port int, version string) string {
 	html = reHTMLScript.ReplaceAllString(html, `$1="$2.js?v=`+version+`"`)
 	script := "<script>" + scriptFor(port) + "</script>"
@@ -40,8 +38,7 @@ func injectHTML(html string, port int, version string) string {
 	return script + html
 }
 
-// patchChannelsJS hooks the two feed-producing calls and keeps the feed list
-// fresh when the user moves between recommended videos.
+// Hooks the feed calls and keeps the current feed on navigation.
 func patchChannelsJS(js, version string) string {
 	js = patchImports(js, version)
 
