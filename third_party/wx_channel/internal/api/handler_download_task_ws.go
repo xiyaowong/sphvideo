@@ -1,0 +1,849 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/rs/zerolog"
+	"gorm.io/gorm"
+
+	"wx_channel/internal/database/model"
+	"wx_channel/internal/services"
+	"wx_channel/pkg/hermes"
+)
+
+const (
+	download_task_ws_create    = "task_create"
+	download_task_ws_upsert    = "task_upsert"
+	download_task_ws_update    = "task_update"
+	download_task_ws_delete    = "task_delete"
+	download_task_ws_stats     = "task_stats"
+	task_ws_linear_match_limit = 8
+
+	// progress_throttle is the minimum interval between progress broadcasts
+	// for a single task. Lower values give smoother UI updates.
+	progress_throttle = 100 * time.Millisecond
+)
+
+// progress_cache_entry caches the DB-derived task state needed to combine an
+// in-memory progress snapshot with its current lifecycle status. Progress WS
+// updates include only mutable fields plus the canonical file path.
+type progress_cache_entry struct {
+	task       model.DownloadTask
+	file_paths map[int]string
+}
+
+type task_broadcast_request struct {
+	event              hermes.EventType
+	progress           *hermes.TaskProgress
+	finished_resources []hermes.TaskFinishedResource
+}
+
+// cache_task_progress_meta loads the task state used by progress patches.
+func (b *DownloadTaskBroadcaster) cache_task_progress_meta(task_id int) {
+	if b.db == nil {
+		b.logger.Info().Int("task_id", task_id).Msg("progress_cache: skip (no db)")
+		return
+	}
+
+	var task model.DownloadTask
+	if err := b.db.Where("id = ?", task_id).First(&task).Error; err != nil {
+		b.logger.Info().Int("task_id", task_id).Err(err).Msg("progress_cache: DB load failed")
+		return
+	}
+	var resources []model.DownloadResource
+	file_paths := make(map[int]string)
+	if err := b.db.Select("id", "download_dir", "name").
+		Where("task_id = ? AND deleted_at IS NULL", task_id).
+		Find(&resources).Error; err != nil {
+		b.logger.Info().Int("task_id", task_id).Err(err).Msg("progress_cache: resource paths load failed")
+	} else {
+		file_paths = make(map[int]string, len(resources))
+		for _, resource := range resources {
+			file_paths[resource.Id] = filepath.Join(resource.DownloadDir, resource.Name)
+		}
+	}
+
+	b.progress_cache_mu.Lock()
+	b.progress_cache[task_id] = &progress_cache_entry{task: task, file_paths: file_paths}
+	b.progress_cache_mu.Unlock()
+
+	b.logger.Info().
+		Int("task_id", task_id).
+		Str("task_name", task.Name).
+		Int("status", task.Status).
+		Msg("progress_cache: populated")
+}
+
+// remove_cached_task_progress_meta clears the cached metadata for a task.
+func (b *DownloadTaskBroadcaster) remove_cached_task_progress_meta(task_id int) {
+	b.progress_cache_mu.Lock()
+	delete(b.progress_cache, task_id)
+	b.progress_cache_mu.Unlock()
+}
+
+// DownloadTaskBroadcaster throttles and dispatches download task WebSocket broadcasts.
+// It runs the heavy build_download_task_record DB query in a goroutine so the
+// download pipeline is never blocked on WS broadcast work. Only one in-flight
+// broadcast per task is permitted, terminal events are queued behind in-flight
+// broadcasts, lifecycle state changes are queued, and EventProgress is
+// throttled.
+type DownloadTaskBroadcaster struct {
+	db                    *gorm.DB
+	logger                *zerolog.Logger
+	download_task_service *services.DownloadTaskService
+	progress_cache_mu     sync.RWMutex
+	progress_cache        map[int]*progress_cache_entry
+	mu                    sync.Mutex
+	active                map[int]bool // tasks currently broadcasting
+	pending               map[int][]task_broadcast_request
+	last                  map[int]time.Time // last broadcast time per task
+}
+
+// NewDownloadTaskBroadcaster constructs the WebSocket projection for Hermes task events.
+func NewDownloadTaskBroadcaster(db *gorm.DB, logger *zerolog.Logger, download_task_service *services.DownloadTaskService) *DownloadTaskBroadcaster {
+	return &DownloadTaskBroadcaster{
+		db:                    db,
+		logger:                logger,
+		download_task_service: download_task_service,
+		progress_cache:        make(map[int]*progress_cache_entry),
+		active:                make(map[int]bool),
+		pending:               make(map[int][]task_broadcast_request),
+		last:                  make(map[int]time.Time),
+	}
+}
+
+func is_terminal_task_event(event hermes.EventType) bool {
+	return event == hermes.EventFinished || event == hermes.EventFailed || event == hermes.EventDeleted
+}
+
+// should_broadcast_download_task_stats reports lifecycle events whose persisted
+// status changes the aggregate task counters. Deletion stats are broadcast from
+// the application deletion event after the soft delete commits, rather than on
+// the earlier Hermes cancellation event.
+func should_broadcast_download_task_stats(event hermes.EventType) bool {
+	switch event {
+	case hermes.EventCreated,
+		hermes.EventPreparing,
+		hermes.EventStarted,
+		hermes.EventPaused,
+		hermes.EventFinished,
+		hermes.EventFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// Notify schedules a broadcast for the given task. Terminal events
+// (finished / failed / deleted) are never dropped; if a progress broadcast is
+// already in-flight, the terminal event is queued and sent immediately after it.
+// For other events
+// (especially EventProgress) broadcasts are throttled to ≈100ms to balance
+// UI smoothness against database load.
+// progress carries in-memory download state from the HermesEngine; when non-nil for
+// EventProgress, the lightweight broadcast_download_task_progress path is used
+// instead of the full DB query path.
+func (b *DownloadTaskBroadcaster) Notify(task_id int, event hermes.EventType, progress *hermes.TaskProgress, finished_resources []hermes.TaskFinishedResource) {
+	req := task_broadcast_request{
+		event:              event,
+		progress:           progress,
+		finished_resources: append([]hermes.TaskFinishedResource(nil), finished_resources...),
+	}
+	var dl, spd int64
+	if progress != nil {
+		dl, spd = progress.Downloaded, progress.Speed
+	}
+	is_progress := event == hermes.EventProgress && progress != nil
+	is_terminal := is_terminal_task_event(event)
+
+	b.mu.Lock()
+	// Progress snapshots may be dropped because a newer one will follow. State
+	// transitions must be delivered after the in-flight broadcast so start,
+	// pause, resume, and terminal states remain observable.
+	if b.active[task_id] {
+		if !is_progress {
+			b.pending[task_id] = append(b.pending[task_id], req)
+		}
+		b.mu.Unlock()
+		if is_progress {
+			b.logger.Debug().
+				Int("task_id", task_id).
+				Int64("dl", dl).
+				Int64("spd", spd).
+				Str("event", string(event)).
+				Msg("progress: skip (active broadcast in-flight)")
+		}
+		return
+	}
+	if is_progress && !is_terminal {
+		if prev, ok := b.last[task_id]; ok && time.Since(prev) < progress_throttle {
+			b.mu.Unlock()
+			if is_progress {
+				b.logger.Debug().
+					Int("task_id", task_id).
+					Int64("dl", dl).
+					Int64("spd", spd).
+					Str("event", string(event)).
+					Dur("since_last", time.Since(prev)).
+					Msg("progress: skip (throttled)")
+			}
+			return
+		}
+	}
+	b.active[task_id] = true
+	b.last[task_id] = time.Now()
+	b.mu.Unlock()
+
+	if is_progress {
+		b.logger.Debug().
+			Int("task_id", task_id).
+			Int64("dl", dl).
+			Int64("spd", spd).
+			Msg("progress: dispatching broadcast")
+	}
+
+	go b.run_task_broadcast(task_id, req)
+}
+
+func (b *DownloadTaskBroadcaster) run_task_broadcast(task_id int, req task_broadcast_request) {
+	terminal_seen := false
+	for {
+		is_progress := req.event == hermes.EventProgress && req.progress != nil
+		is_terminal := is_terminal_task_event(req.event)
+		if is_terminal {
+			terminal_seen = true
+		}
+		switch {
+		case req.event == hermes.EventCreated:
+			b.broadcast_download_task_create(task_id)
+			b.cache_task_progress_meta(task_id)
+		case is_progress:
+			b.broadcast_download_task_progress(task_id, req.progress)
+		case req.event == hermes.EventPreparing || req.event == hermes.EventStarted || req.event == hermes.EventPaused:
+			b.broadcast_download_task_state(task_id)
+			b.cache_task_progress_meta(task_id)
+		case req.event == hermes.EventFinished:
+			b.broadcast_download_task_finished(task_id, req.finished_resources)
+			b.remove_cached_task_progress_meta(task_id)
+		default:
+			b.broadcast_download_task_upsert([]int{task_id})
+			if is_terminal {
+				b.remove_cached_task_progress_meta(task_id)
+			} else {
+				b.cache_task_progress_meta(task_id)
+			}
+		}
+		if should_broadcast_download_task_stats(req.event) {
+			b.broadcast_download_task_stats()
+		}
+
+		next_request, has_next := b.complete_task_broadcast(task_id, terminal_seen)
+		if !has_next {
+			return
+		}
+		req = next_request
+	}
+}
+
+func (b *DownloadTaskBroadcaster) complete_task_broadcast(task_id int, terminal_seen bool) (task_broadcast_request, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	pending_requests := b.pending[task_id]
+	if len(pending_requests) == 0 {
+		delete(b.active, task_id)
+		delete(b.pending, task_id)
+		if terminal_seen {
+			delete(b.last, task_id)
+		}
+		return task_broadcast_request{}, false
+	}
+
+	next_request := pending_requests[0]
+	if len(pending_requests) == 1 {
+		delete(b.pending, task_id)
+	} else {
+		b.pending[task_id] = pending_requests[1:]
+	}
+	b.last[task_id] = time.Now()
+	return next_request, true
+}
+
+// DownloadTaskWSUpdate is a lightweight patch for an existing task. Stable
+// fields such as names, URLs, configuration, and creation time are supplied
+// only by a full task_create/task_upsert record.
+type DownloadTaskWSUpdate struct {
+	ID         int                        `json:"id"`
+	Status     int                        `json:"status"`
+	Size       int64                      `json:"size"`
+	Downloaded int64                      `json:"downloaded"`
+	Speed      int64                      `json:"speed"`
+	Progress   float64                    `json:"progress"`
+	Error      string                     `json:"error"`
+	Files      []DownloadTaskFileWSUpdate `json:"files,omitempty"`
+	UpdatedAt  int64                      `json:"updated_at,omitempty"`
+}
+
+// DownloadTaskFileWSUpdate is the mutable subset of a task file record.
+type DownloadTaskFileWSUpdate struct {
+	ID         int     `json:"id"`
+	FilePath   string  `json:"file_path"`
+	Status     string  `json:"status"`
+	Size       int64   `json:"size"`
+	Downloaded int64   `json:"downloaded"`
+	Speed      int64   `json:"speed"`
+	Progress   float64 `json:"progress"`
+	Error      string  `json:"error"`
+}
+
+// DownloadTaskWSMessage carries full REST-isomorphic task records, lightweight
+// updates, deleted task IDs, or aggregate stats.
+type DownloadTaskWSMessage struct {
+	Type    string                        `json:"type"`
+	Tasks   []services.DownloadTaskRecord `json:"tasks,omitempty"`
+	Updates []DownloadTaskWSUpdate        `json:"updates,omitempty"`
+	TaskIDs []int                         `json:"task_ids,omitempty"`
+	Stats   *services.DownloadTaskStats   `json:"stats,omitempty"`
+}
+
+var v1_download_task_upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *http.Request) bool { return true },
+}
+
+var v1_task_bridge = new_task_ws_pool()
+
+// task_ws_pool is a WebSocket connection pool.
+type task_ws_pool struct {
+	mu      sync.RWMutex
+	clients map[*v1_task_client]bool
+}
+
+func new_task_ws_pool() *task_ws_pool {
+	return &task_ws_pool{clients: make(map[*v1_task_client]bool)}
+}
+
+func (h *task_ws_pool) add(client *v1_task_client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clients[client] = true
+}
+
+func (h *task_ws_pool) remove(client *v1_task_client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.clients[client]; ok {
+		delete(h.clients, client)
+		close(client.send)
+	}
+}
+
+func (h *task_ws_pool) has_task_subscriber(task_id int) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for client := range h.clients {
+		if client.task_id == 0 || client.task_id == task_id {
+			return true
+		}
+	}
+	return false
+}
+
+// close_all asks every download task WebSocket writer to send a normal close
+// frame, then removes the clients so the pool can be reused after a restart.
+func (h *task_ws_pool) close_all() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for client := range h.clients {
+		delete(h.clients, client)
+		close(client.send)
+	}
+}
+
+// BroadcastTasks pushes a unified task record array to clients subscribed to the given task_ids.
+func (h *task_ws_pool) BroadcastTasks(task_ids []int, payload DownloadTaskWSMessage) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	var task_id_set map[int]struct{}
+	if len(task_ids) > task_ws_linear_match_limit {
+		task_id_set = make(map[int]struct{}, len(task_ids))
+		for _, task_id := range task_ids {
+			task_id_set[task_id] = struct{}{}
+		}
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for client := range h.clients {
+		if client.task_id != 0 {
+			matched := false
+			if task_id_set != nil {
+				_, matched = task_id_set[client.task_id]
+			} else {
+				matched = task_id_list_contains(task_ids, client.task_id)
+			}
+			if !matched {
+				continue
+			}
+		}
+		select {
+		case client.send <- data:
+		default:
+		}
+	}
+}
+
+func task_id_list_contains(task_ids []int, wanted_task_id int) bool {
+	for _, task_id := range task_ids {
+		if task_id == wanted_task_id {
+			return true
+		}
+	}
+	return false
+}
+
+// BroadcastStats pushes task statistics to all clients.
+func (h *task_ws_pool) BroadcastStats(stats *services.DownloadTaskStats) {
+	data, err := json.Marshal(DownloadTaskWSMessage{
+		Type:  download_task_ws_stats,
+		Stats: stats,
+	})
+	if err != nil {
+		return
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for client := range h.clients {
+		select {
+		case client.send <- data:
+		default:
+		}
+	}
+}
+
+type v1_task_client struct {
+	conn    *websocket.Conn
+	send    chan []byte
+	task_id int
+}
+
+// handle_download_task_ws is the download task record push WebSocket.
+// GET /ws/v1/download_task?task_id=1
+func (c *APIClient) handle_download_task_ws(ctx *gin.Context) {
+	conn, err := v1_download_task_upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
+	if err != nil {
+		return
+	}
+
+	task_id, _ := strconv.Atoi(ctx.Query("task_id"))
+	client := &v1_task_client{
+		conn:    conn,
+		send:    make(chan []byte, 256),
+		task_id: task_id,
+	}
+	v1_task_bridge.add(client)
+	go client.write_pump()
+
+	if client.task_id != 0 {
+		if record, record_err := c.download_task_service.BuildTaskRecord(client.task_id); record_err == nil && record != nil {
+			client.enqueue(DownloadTaskWSMessage{Type: download_task_ws_upsert, Tasks: []services.DownloadTaskRecord{*record}})
+		}
+		// Populate the progress cache so subsequent progress broadcasts are instant.
+		c.download_task_broadcaster.cache_task_progress_meta(client.task_id)
+	}
+
+	client.read_pump()
+	v1_task_bridge.remove(client)
+}
+
+func (b *DownloadTaskBroadcaster) broadcast_download_task_upsert(task_ids []int) {
+	records := make([]services.DownloadTaskRecord, 0, len(task_ids))
+	for _, id := range task_ids {
+		record, err := b.download_task_service.BuildTaskRecord(id)
+		if err != nil || record == nil {
+			continue
+		}
+		records = append(records, *record)
+	}
+	if len(records) == 0 {
+		return
+	}
+	v1_task_bridge.BroadcastTasks(task_ids, DownloadTaskWSMessage{
+		Type:  download_task_ws_upsert,
+		Tasks: records,
+	})
+}
+
+// broadcast_download_task_finished sends a complete record with the final
+// resource metadata supplied by Hermes. Overlaying the event snapshot makes
+// the name chosen by the final filesystem rename authoritative for this push.
+func (b *DownloadTaskBroadcaster) broadcast_download_task_finished(task_id int, resources []hermes.TaskFinishedResource) {
+	record, err := b.download_task_service.BuildTaskRecord(task_id)
+	if err != nil || record == nil {
+		return
+	}
+	apply_finished_resource_snapshot(record, resources)
+	v1_task_bridge.BroadcastTasks([]int{task_id}, DownloadTaskWSMessage{
+		Type:  download_task_ws_upsert,
+		Tasks: []services.DownloadTaskRecord{*record},
+	})
+}
+
+func apply_finished_resource_snapshot(record *services.DownloadTaskRecord, resources []hermes.TaskFinishedResource) {
+	if record == nil || len(resources) == 0 {
+		return
+	}
+	by_id := make(map[int]hermes.TaskFinishedResource, len(resources))
+	for _, resource := range resources {
+		by_id[resource.ID] = resource
+	}
+	for index := range record.Files {
+		resource, ok := by_id[record.Files[index].ID]
+		if !ok {
+			continue
+		}
+		record.Files[index].DownloadDir = resource.DownloadDir
+		record.Files[index].Name = resource.Name
+		record.Files[index].FilePath = filepath.Join(resource.DownloadDir, resource.Name)
+		record.Files[index].Kind = resource.Kind
+		record.Files[index].Type = resource.Type
+		record.Files[index].Size = resource.Size
+	}
+}
+
+// broadcast_download_task_create sends a complete REST-isomorphic record so
+// the frontend can insert a task without an additional list request.
+func (b *DownloadTaskBroadcaster) broadcast_download_task_create(task_id int) {
+	record, err := b.download_task_service.BuildTaskRecord(task_id)
+	if err != nil || record == nil {
+		return
+	}
+	v1_task_bridge.BroadcastTasks([]int{task_id}, DownloadTaskWSMessage{
+		Type:  download_task_ws_create,
+		Tasks: []services.DownloadTaskRecord{*record},
+	})
+}
+
+func download_task_ws_update_from_record(record services.DownloadTaskRecord) DownloadTaskWSUpdate {
+	files := make([]DownloadTaskFileWSUpdate, 0, len(record.Files))
+	for _, file := range record.Files {
+		files = append(files, DownloadTaskFileWSUpdate{
+			ID:         file.ID,
+			FilePath:   file.FilePath,
+			Status:     file.Status,
+			Size:       file.Size,
+			Downloaded: file.Downloaded,
+			Speed:      file.Speed,
+			Progress:   file.Progress,
+			Error:      file.Error,
+		})
+	}
+	return DownloadTaskWSUpdate{
+		ID:         record.ID,
+		Status:     record.Status,
+		Size:       record.Size,
+		Downloaded: record.Downloaded,
+		Speed:      record.Speed,
+		Progress:   record.Progress,
+		Error:      record.Error,
+		Files:      files,
+		UpdatedAt:  record.UpdatedAt,
+	}
+}
+
+// broadcast_download_task_state sends only mutable fields for start/resume and
+// pause transitions. BuildTaskRecord remains the source of truth, but stable
+// list fields are not serialized again.
+func (b *DownloadTaskBroadcaster) broadcast_download_task_state(task_id int) {
+	record, err := b.download_task_service.BuildTaskRecord(task_id)
+	if err != nil || record == nil {
+		return
+	}
+	v1_task_bridge.BroadcastTasks([]int{task_id}, DownloadTaskWSMessage{
+		Type:    download_task_ws_update,
+		Updates: []DownloadTaskWSUpdate{download_task_ws_update_from_record(*record)},
+	})
+}
+
+// broadcast_download_task_progress builds a lightweight update from cached task
+// state and in-memory progress, without database queries or stable metadata.
+func (b *DownloadTaskBroadcaster) broadcast_download_task_progress(task_id int, p *hermes.TaskProgress) {
+	if p == nil {
+		return
+	}
+	if !v1_task_bridge.has_task_subscriber(task_id) {
+		return
+	}
+
+	b.progress_cache_mu.RLock()
+	entry, ok := b.progress_cache[task_id]
+	b.progress_cache_mu.RUnlock()
+
+	// Cache miss: the task was started before this code was deployed or the
+	// cache was evicted. Fall back to a one-time DB load and cache it.
+	if !ok && b.db != nil {
+		b.logger.Info().Int("task_id", task_id).Msg("progress_cache: miss, loading from DB")
+		b.cache_task_progress_meta(task_id)
+		b.progress_cache_mu.RLock()
+		entry, ok = b.progress_cache[task_id]
+		b.progress_cache_mu.RUnlock()
+	}
+	if !ok {
+		b.logger.Info().Int("task_id", task_id).Msg("progress_cache: miss, giving up")
+		return
+	}
+
+	task := entry.task
+	// Update cached status from in-memory progress: if resources are being
+	// downloaded, the task is effectively in Downloading state. This avoids
+	// stale status in the cache when the task transitions between states.
+	cached_status := task.Status
+	if p.Downloaded > 0 && p.Downloaded < p.TotalSize {
+		cached_status = model.TaskStatusDownloading
+	}
+
+	error_message := ""
+	if cached_status == model.TaskStatusFailed {
+		error_message = task.ErrorMessage
+	}
+
+	files := make([]DownloadTaskFileWSUpdate, 0, len(p.Resources))
+	finished_file_count := 0
+	has_downloading_file := false
+	for _, rp := range p.Resources {
+		status := download_task_file_ws_status(cached_status, rp)
+		switch status {
+		case "finished":
+			finished_file_count++
+		case "downloading":
+			has_downloading_file = true
+		}
+		file_resource_status := model.TaskStatusWaiting
+		if status == "finished" {
+			file_resource_status = model.TaskStatusFinished
+		} else if status == "downloading" {
+			file_resource_status = model.TaskStatusDownloading
+		}
+		file_progress := services.TaskProgressPercent(rp.Downloaded, rp.Size, file_resource_status)
+		files = append(files, DownloadTaskFileWSUpdate{
+			ID:         rp.ID,
+			FilePath:   entry.file_paths[rp.ID],
+			Status:     status,
+			Size:       rp.Size,
+			Downloaded: rp.Downloaded,
+			Speed:      rp.Speed,
+			Progress:   file_progress,
+			Error:      error_message,
+		})
+	}
+
+	effective_status := services.ComputeEffectiveTaskStatusFromSummary(
+		cached_status,
+		len(p.Resources),
+		finished_file_count,
+		has_downloading_file,
+	)
+
+	pct := services.TaskProgressPercent(p.Downloaded, p.TotalSize, effective_status)
+
+	update := DownloadTaskWSUpdate{
+		ID:         task.Id,
+		Status:     effective_status,
+		Size:       p.TotalSize,
+		Downloaded: p.Downloaded,
+		Speed:      p.Speed,
+		Progress:   pct,
+		Error:      error_message,
+		Files:      files,
+	}
+
+	// Cache invalidation is also used as a terminal-event barrier. Holding the
+	// read lock through the send guarantees that a stop handler which removes
+	// this entry can publish the final DB-backed record after any older progress.
+	b.progress_cache_mu.RLock()
+	current_entry, still_current := b.progress_cache[task_id]
+	if !still_current || current_entry != entry {
+		b.progress_cache_mu.RUnlock()
+		return
+	}
+	v1_task_bridge.BroadcastTasks([]int{task_id}, DownloadTaskWSMessage{
+		Type:    download_task_ws_update,
+		Updates: []DownloadTaskWSUpdate{update},
+	})
+	b.progress_cache_mu.RUnlock()
+}
+
+func download_task_file_ws_status(cached_status int, resource_progress hermes.ResourceProgress) string {
+	status := "waiting"
+	if resource_progress.Size > 0 && resource_progress.Downloaded >= resource_progress.Size {
+		status = "finished"
+	} else if resource_progress.Downloaded > 0 ||
+		resource_progress.Speed > 0 ||
+		cached_status == model.TaskStatusDownloading {
+		status = "downloading"
+	}
+	if status == "finished" {
+		return status
+	}
+	switch cached_status {
+	case model.TaskStatusPaused:
+		return "paused"
+	case model.TaskStatusFailed:
+		return "error"
+	case model.TaskStatusCancelled:
+		return "cancelled"
+	default:
+		return status
+	}
+}
+
+type download_task_status_count struct {
+	Status int `gorm:"column:status"`
+	Count  int `gorm:"column:count"`
+}
+
+func add_download_task_stats_count(stats *services.DownloadTaskStats, status, count int) {
+	stats.Total += count
+	switch status {
+	case model.TaskStatusWaiting, model.TaskStatusPreparing:
+		stats.Waiting += count
+	case model.TaskStatusDownloading, model.TaskStatusMerging:
+		stats.Downloading += count
+	case model.TaskStatusPaused:
+		stats.Paused += count
+	case model.TaskStatusFinished:
+		stats.Finished += count
+	case model.TaskStatusFailed, model.TaskStatusCancelled:
+		stats.Error += count
+	}
+}
+
+// broadcast_download_task_stats queries task counts by status from the database and pushes them to all WS clients.
+func (b *DownloadTaskBroadcaster) broadcast_download_task_stats() {
+	if b.db == nil {
+		return
+	}
+	var counts []download_task_status_count
+	if err := b.db.Model(&model.DownloadTask{}).
+		Select("status, COUNT(*) AS count").
+		Where("deleted_at IS NULL").
+		Group("status").
+		Scan(&counts).Error; err != nil {
+		b.logger.Error().Err(err).Msg("Failed to query download task statistics")
+		return
+	}
+	stats := &services.DownloadTaskStats{}
+	for _, sc := range counts {
+		add_download_task_stats_count(stats, sc.Status, sc.Count)
+	}
+	v1_task_bridge.BroadcastStats(stats)
+}
+
+// NotifyCreated broadcasts a task that was persisted without starting Hermes.
+func (b *DownloadTaskBroadcaster) NotifyCreated(task_id int) {
+	if b == nil || task_id <= 0 {
+		return
+	}
+	b.broadcast_download_task_create(task_id)
+	b.cache_task_progress_meta(task_id)
+	b.broadcast_download_task_stats()
+}
+
+// NotifyDeleted broadcasts a deletion after the task graph soft deletion commits.
+func (b *DownloadTaskBroadcaster) NotifyDeleted(task_id int) {
+	if b == nil || task_id <= 0 {
+		return
+	}
+	b.remove_cached_task_progress_meta(task_id)
+	b.broadcast_download_task_delete([]int{task_id})
+	b.broadcast_download_task_stats()
+}
+
+func (b *DownloadTaskBroadcaster) broadcast_download_task_delete(task_ids []int) {
+	if len(task_ids) == 0 {
+		return
+	}
+	v1_task_bridge.BroadcastTasks(task_ids, DownloadTaskWSMessage{
+		Type:    download_task_ws_delete,
+		TaskIDs: task_ids,
+	})
+}
+
+func (c *v1_task_client) enqueue(payload DownloadTaskWSMessage) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	select {
+	case c.send <- data:
+	default:
+	}
+}
+
+func (c *v1_task_client) read_pump() {
+	defer c.conn.Close()
+	c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		return nil
+	})
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var body struct {
+			Type   string `json:"type"`
+			TaskID int    `json:"task_id"`
+		}
+		if err := json.Unmarshal(message, &body); err != nil {
+			continue
+		}
+		if body.Type == "subscribe" && body.TaskID > 0 {
+			c.task_id = body.TaskID
+		}
+	}
+}
+
+func (c *v1_task_client) write_pump() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				_ = c.conn.WriteMessage(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "server closing"),
+				)
+				return
+			}
+			writer, err := c.conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return
+			}
+			_, _ = writer.Write(message)
+			if err := writer.Close(); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}

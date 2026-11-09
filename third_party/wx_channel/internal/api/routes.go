@@ -1,0 +1,215 @@
+package api
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"wx_channel/frontend"
+	"wx_channel/internal/config"
+)
+
+func (c *APIClient) SetupRoutes() {
+	// favicon
+	c.engine.GET("/favicon.ico", c.handle_favicon)
+	c.engine.HEAD("/favicon.ico", c.handle_favicon)
+	c.setup_static_asset_routes()
+	// c.engine.GET("/", c.handle_index)
+	c.engine.GET("/", func(ctx *gin.Context) {
+		c.renderFrontendFile(ctx, "index.html")
+	})
+	// !!
+	c.engine.POST("/api/scraper/fetch", c.handle_scraper_fetch)
+	// GET remains available for callers migrating from the former synchronous API.
+	c.engine.GET("/api/scraper/fetch", c.handle_scraper_fetch)
+	c.engine.GET("/api/scraper/job", c.handle_scraper_job)
+	c.engine.GET("/api/scraper/platform/status", c.handle_scraper_platform_status)
+	c.engine.POST("/api/scraper/fetch/interrupt", c.handle_scraper_fetch_interrupt)
+	c.engine.GET("/api/scraper/cache/content", c.handle_scraper_cache_content)
+	c.engine.POST("/api/scraper/cache/clear", c.handle_scraper_cache_clear)
+	// File transfer helper endpoints
+	c.engine.GET("/api/filehelper/qrcode", c.file_helper.HandleGetQRCode)
+	c.engine.GET("/api/filehelper/login/wait", c.file_helper.HandleWaitLogin)
+	c.engine.GET("/api/filehelper/status", c.file_helper.HandleGetStatus)
+	c.engine.GET("/api/filehelper/synccheck", c.file_helper.HandleSyncCheck)
+	c.engine.GET("/api/filehelper/sync", c.file_helper.HandleSyncMessages)
+	c.engine.GET("/api/filehelper/messages", c.file_helper.HandleGetMessages)
+	c.engine.POST("/api/filehelper/send", c.file_helper.HandleSendMessage)
+	c.engine.POST("/api/filehelper/logout", c.file_helper.HandleLogout)
+	c.engine.POST("/api/filehelper/parse_finder_feed", c.file_helper.HandleParseFinderFeed)
+	// Local file operations
+	c.engine.POST("/api/show_file", c.handle_show_file)
+	c.engine.GET("/api/file", c.handle_fetch_file)
+	c.engine.POST("/api/v1/fs/list", c.handle_list_files)
+	c.engine.GET("/api/v1/download_task/live/:task_id/:resource_id/:asset_name", c.handle_stream_playback_asset)
+	c.engine.HEAD("/api/v1/download_task/live/:task_id/:resource_id/:asset_name", c.handle_stream_playback_asset)
+	// Media proxies
+	c.engine.GET("/imgproxy", c.handle_img_proxy)
+
+	// c.engine.GET("/migration", c.handle_migration_page)
+	// c.engine.POST("/api/v1/migration/load", c.handle_migration_load)
+	// c.engine.POST("/api/v1/migration/table", c.handle_migration_table)
+	// c.engine.POST("/api/v1/migration/file/list", c.handle_migration_file_list)
+	// c.engine.GET("/api/v1/migration/common_dirs", c.handle_migration_common_dirs)
+	// c.engine.POST("/api/task/pipeline/start", c.handle_probe_platform_download_task)
+	// c.engine.POST("/api/task/probe", c.handle_probe_platform_download_task)
+	// c.engine.GET("/api/task/pipeline/workflow", c.handle_fetch_platform_download_workflow)
+	// c.engine.POST("/api/task/pipeline/resume", c.handle_resume_platform_download_pipeline)
+	c.engine.GET("/ws/v1/download_task", c.handle_download_task_ws)
+	c.engine.GET("/ws/scraper", c.handle_scraper_ws)
+	c.engine.POST("/api/browse_history/create", c.handle_create_browse_history)
+	c.engine.POST("/api/browse_history/list", c.handle_fetch_browse_history_list)
+	c.engine.POST("/api/v1/download_task/prepare", c.handle_prepare_download_task)
+	c.engine.POST("/api/v1/download_task/update_resource", c.handle_update_download_resource)
+	c.engine.POST("/api/v1/download_task/prepare_by_url", c.handle_prepare_download_task_by_url)
+	c.engine.POST("/api/v1/download_task/create", c.handle_create_download_task)
+	c.engine.POST("/api/v1/download_task/create_by_url", c.handle_create_download_task_by_url)
+	c.engine.POST("/api/v1/download_task/start", c.handle_start_download_task)
+	c.engine.POST("/api/v1/download_task/pause", c.handle_pause_download_task)
+	c.engine.POST("/api/v1/download_task/resume", c.handle_resume_download_task)
+	c.engine.POST("/api/v1/download_task/retry", c.handle_retry_download_task)
+	c.engine.POST("/api/v1/download_task/delete", c.handle_delete_download_task)
+	c.engine.POST("/api/v1/download_task/start_all", c.handle_start_all_download_task)
+	c.engine.POST("/api/v1/download_task/pause_all", c.handle_pause_all_download_task)
+	c.engine.POST("/api/v1/download_task/clear", c.handle_clear_download_task)
+	c.engine.POST("/api/v1/download_task/clear_all", c.handle_clear_all_download_task)
+	c.engine.POST("/api/v1/download_task/check_files", c.handle_check_download_task_files)
+	c.engine.GET("/api/v1/download_task/list", c.handle_list_download_task)
+	c.engine.GET("/api/v1/download_task/detail", c.handle_download_task_detail)
+	c.engine.POST("/api/v1/third_party_downloader/probe", c.handle_probe_third_party_downloader)
+	c.engine.POST("/api/v1/third_party_downloader/create", c.handle_create_third_party_download)
+	c.engine.POST("/api/v1/third_party_downloader/status", c.handle_third_party_download_status)
+	c.engine.GET("/api/bridge/status", c.handle_bridge_status)
+	c.engine.GET("/api/bridge/tasks", c.handle_bridge_task_list)
+	c.engine.POST("/api/bridge/call", c.handle_bridge_call_submit)
+	c.engine.POST("/api/bridge/tasks", c.handle_bridge_call_submit)
+	c.engine.GET("/api/bridge/tasks/:id", c.handle_bridge_task_get)
+	c.engine.POST("/api/bridge/tasks/wxchannels", c.handle_bridge_wxchannels_submit)
+	c.engine.POST("/api/bridge/tasks/download", c.handle_bridge_download_submit)
+	// c.engine.GET("/api/influencers", c.handle_influencer_list)
+	// c.engine.GET("/api/influencers/:id", c.handle_influencer_get)
+	// c.engine.POST("/api/influencers", c.handle_influencer_create)
+	// c.engine.PUT("/api/influencers/:id", c.handle_influencer_update)
+	// c.engine.GET("/influencers", c.handle_influencer_list)
+	// c.engine.GET("/influencers/:id", c.handle_influencer_get)
+	// c.engine.POST("/influencers", c.handle_influencer_create)
+	// c.engine.PUT("/influencers/:id", c.handle_influencer_update)
+	c.engine.GET("/api/account/list", c.handle_account_list)
+	c.engine.GET("/api/account/:scope/content/list", c.handle_account_details_content_list)
+	c.engine.GET("/api/account/details/:scope/content/list", c.handle_account_details_content_list)
+	c.engine.POST("/api/account/synchronize", c.handle_account_synchronize)
+	c.engine.GET("/api/content/list", c.handle_content_list)
+	c.engine.GET("/api/content/detail", c.handle_content_detail)
+	c.engine.GET("/api/content/relations", c.handle_content_relations)
+	// Other endpoints
+	c.engine.GET("/api/logs", c.handle_logs)
+	c.engine.POST("/api/logs/clear", c.handle_clear_logs)
+	c.engine.POST("/report", c.handle_frontend_report)
+	c.engine.GET("/api/status", c.handle_status)
+	c.engine.GET("/api/config", c.handle_application_config_get)
+	c.engine.POST("/api/config", c.handle_application_config_update)
+	c.engine.GET("/api/restart/status", c.handle_application_restart_status)
+	c.engine.GET("/api/update/check", c.handle_update_check)
+	c.engine.GET("/api/update/status", c.handle_update_status)
+	c.engine.POST("/api/update/download", c.handle_update_download)
+	c.engine.POST("/api/update/restart", c.handle_update_restart)
+	c.engine.GET("/api/mcp/status", c.handle_mcp_status)
+	c.engine.POST("/api/mcp/enable", c.handle_mcp_enable)
+	c.engine.POST("/api/mcp/disable", c.handle_mcp_disable)
+	c.engine.POST("/mcp", c.handle_mcp_transport)
+	c.engine.GET("/mcp", c.handle_mcp_transport)
+	c.engine.DELETE("/mcp", c.handle_mcp_transport)
+	c.engine.POST("/api/service/start", c.handle_service_start)
+	c.engine.POST("/api/service/stop", c.handle_service_stop)
+	c.engine.POST("/api/service/config", c.handle_service_config_update)
+	c.engine.GET("/api/proxy/status", c.handle_proxy_status)
+	c.engine.POST("/api/proxy/config", c.handle_proxy_config_update)
+	c.engine.POST("/api/proxy/restart", c.handle_proxy_restart)
+	c.engine.POST("/api/proxy/system/enable", c.handle_proxy_system_enable)
+	c.engine.POST("/api/proxy/system/disable", c.handle_proxy_system_disable)
+	c.engine.GET("/api/proxy/certificate/status", c.handle_proxy_certificate_status)
+	c.engine.GET("/api/proxy/certificate/pem", c.handle_proxy_certificate_pem)
+	c.engine.POST("/api/proxy/certificate/generate", c.handle_proxy_certificate_generate)
+	c.engine.POST("/api/proxy/certificate/install", c.handle_proxy_certificate_install)
+	c.engine.POST("/api/proxy/certificate/replace", c.handle_proxy_certificate_replace)
+	c.engine.POST("/api/proxy/certificate/uninstall", c.handle_proxy_certificate_uninstall)
+	c.engine.POST("/api/proxy/certificate/uninstall_by_name", c.handle_proxy_certificate_uninstall_by_name)
+	c.engine.POST("/api/cookies/update", c.handle_cookie_update)
+}
+
+func (c *APIClient) handle_favicon(ctx *gin.Context) {
+	data, err := frontend.FS.ReadFile("public/favicon.ico")
+	if err != nil {
+		ctx.String(http.StatusInternalServerError, "favicon is unavailable")
+		return
+	}
+	ctx.Header("Content-Type", "image/x-icon")
+	ctx.Header("Cache-Control", "public, max-age=31536000, immutable")
+	ctx.Header("Content-Length", strconv.Itoa(len(data)))
+	if ctx.Request.Method == http.MethodHead {
+		ctx.Status(http.StatusOK)
+		return
+	}
+	ctx.Data(http.StatusOK, "image/x-icon", data)
+}
+
+func (c *APIClient) handle_status(ctx *gin.Context) {
+	api_host := c.cfg.Hostname
+	api_port := c.cfg.Port
+	proxy_addr := "127.0.0.1:2023"
+	if c.cfg.Original != nil {
+		if host := c.cfg.Original.GetString("api.hostname"); host != "" {
+			api_host = host
+		}
+		if port := c.cfg.Original.GetInt("api.port"); port > 0 {
+			api_port = port
+		}
+		host := c.cfg.Original.GetString("proxy.hostname")
+		port := c.cfg.Original.GetInt("proxy.port")
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		if port <= 0 {
+			port = 2023
+		}
+		proxy_addr = fmt.Sprintf("%s:%d", host, port)
+	}
+	api_addr := fmt.Sprintf("%s:%d", api_host, api_port)
+	api_client_addr := config.APIClientHost(api_host, api_port)
+	statuses := gin.H{}
+	for name, status := range c.service_statuses_map() {
+		statuses[name] = status
+	}
+	data := gin.H{
+		"version":         c.cfg.Version,
+		"server_statuses": statuses,
+		"api": gin.H{
+			"addr":      api_addr,
+			"listening": check_port(api_client_addr),
+			"status":    statuses["api"],
+		},
+		"proxy": gin.H{
+			"addr":      proxy_addr,
+			"listening": check_port(proxy_addr),
+			"status":    statuses["interceptor"],
+		},
+	}
+	ctx.JSON(200, gin.H{
+		"code": 0,
+		"msg":  "ok",
+		"data": data,
+	})
+}
+
+func check_port(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}

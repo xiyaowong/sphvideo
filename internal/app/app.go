@@ -1,7 +1,6 @@
 package app
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,37 +11,36 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
-	"sphvideo/internal/download"
 	"sphvideo/internal/proxy"
+	"wx_channel/sphgui"
 )
 
+const apiPort = 2022
+
 type State struct {
-	svc *proxy.Service
 	win *mygo.Window
 
-	mu         sync.Mutex
-	status     string
-	saveDir    string
-	running    bool
-	starting   bool
-	stopping   bool
-	repairing  bool
-	lastResult string
-	lastPulse  time.Time
+	mu       sync.Mutex
+	status   string
+	saveDir  string
+	running  bool
+	starting bool
+	stopping bool
+
+	repairing     bool
+	lastResult    string
+	lastPulse     time.Time
+	startedAt     time.Time
+	pageConnected bool
 
 	advancedOpen bool
+
+	svc   *sphgui.App
+	guard *proxy.Guard
 }
 
 func New() *State {
-	def := defaultSaveDir()
-	s := &State{saveDir: loadSaveDir(def)}
-	s.svc = proxy.New(s.saveDir, s.setStatus)
-	s.svc.SetOnJobDone(s.onJobDone)
-	s.svc.SetReveal(func(path string) error {
-		mygo.Shell.ShowItemInFolder(path)
-		return nil
-	})
-	return s
+	return &State{saveDir: defaultSaveDir()}
 }
 
 func (s *State) AttachWindow(w *mygo.Window) {
@@ -59,11 +57,17 @@ func (s *State) windowFocused() bool {
 }
 
 func (s *State) Stop() {
-	s.svc.Stop()
+	s.stopService()
 }
 
 func (s *State) ActiveDownloads() int {
-	return len(s.svc.Info().Active)
+	s.mu.Lock()
+	app := s.svc
+	s.mu.Unlock()
+	if app == nil {
+		return 0
+	}
+	return len(app.Snapshot().Active)
 }
 
 func (s *State) Toggle() {
@@ -82,9 +86,19 @@ func (s *State) snapshot() (status, dir string, running, starting, stopping, rep
 	return s.status, s.saveDir, s.running, s.starting, s.stopping, s.repairing, s.lastResult
 }
 
+func (s *State) appSnapshot() sphgui.Snapshot {
+	s.mu.Lock()
+	app := s.svc
+	s.mu.Unlock()
+	if app == nil {
+		return sphgui.Snapshot{}
+	}
+	return app.Snapshot()
+}
+
 func (s *State) toggle() {
 	s.mu.Lock()
-	if s.starting || s.stopping {
+	if s.starting || s.stopping || s.repairing {
 		s.mu.Unlock()
 		return
 	}
@@ -101,10 +115,14 @@ func (s *State) toggle() {
 			return
 		}
 		go func() {
-			s.svc.Stop()
+			err := s.stopService()
 			s.mu.Lock()
-			s.running = false
 			s.stopping = false
+			if err != nil {
+				s.status = "已停止，但临时证书清理失败。请在「说明」里点「修复网络」。"
+			} else {
+				s.status = "已停止"
+			}
 			s.mu.Unlock()
 		}()
 		return
@@ -114,28 +132,26 @@ func (s *State) toggle() {
 	s.mu.Unlock()
 
 	go func() {
-		err := s.svc.Start()
+		err := s.startService()
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.starting = false
 		if err != nil {
 			s.running = false
 			s.status = "启动失败：" + friendlyStartError(err)
-			return
 		}
-		s.running = true
 	}()
 }
 
 func (s *State) confirmCancelDownloads() bool {
-	n := len(s.svc.Info().Active)
+	n := s.ActiveDownloads()
 	if n == 0 {
 		return true
 	}
 	res, err := mygo.Dialog.Message(mygo.MessageOptions{
 		Type:               mygo.MessageWarning,
 		Title:              "停止会取消下载",
-		Message:            fmt.Sprintf("还有 %d 个文件正在下载。停止后网络设置会恢复，未完成的文件会被删除。", n),
+		Message:            fmt.Sprintf("还有 %d 个文件正在下载。停止后网络设置会恢复，未完成的任务会被取消。", n),
 		Buttons:            []string{"停止并取消下载", "继续下载"},
 		DefaultButton:      1,
 		CancelButton:       1,
@@ -147,9 +163,71 @@ func (s *State) confirmCancelDownloads() bool {
 	return res.Button == 0
 }
 
+func (s *State) startService() error {
+	s.mu.Lock()
+	dir := s.saveDir
+	s.mu.Unlock()
+
+	if err := proxy.EnsurePortFree(apiPort); err != nil {
+		return err
+	}
+	proxyPort, err := proxy.PickProxyPort()
+	if err != nil {
+		return err
+	}
+	guard, err := proxy.Prepare(proxyPort)
+	if err != nil {
+		return err
+	}
+	app, err := sphgui.Start(sphgui.Options{
+		Version:         version(),
+		SaveDir:         dir,
+		APIPort:         apiPort,
+		ProxyPort:       proxyPort,
+		CertPEM:         guard.CertPEM(),
+		KeyPEM:          guard.KeyPEM(),
+		OnDownload:      s.onDownload,
+		OnPageConnected: s.onPageConnected,
+	})
+	if err != nil {
+		_ = guard.Close()
+		return err
+	}
+
+	s.mu.Lock()
+	s.guard = guard
+	s.svc = app
+	s.running = true
+	s.status = ""
+	s.startedAt = time.Now()
+	s.pageConnected = false
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *State) stopService() error {
+	s.mu.Lock()
+	app := s.svc
+	guard := s.guard
+	s.svc = nil
+	s.guard = nil
+	s.running = false
+	s.pageConnected = false
+	s.startedAt = time.Time{}
+	s.mu.Unlock()
+
+	if app != nil {
+		app.Stop()
+	}
+	if guard != nil {
+		return guard.Close()
+	}
+	return nil
+}
+
 func (s *State) repair() {
 	s.mu.Lock()
-	if s.starting || s.stopping {
+	if s.starting || s.stopping || s.repairing {
 		s.mu.Unlock()
 		return
 	}
@@ -159,20 +237,15 @@ func (s *State) repair() {
 		return
 	}
 	s.mu.Lock()
-	s.starting = false
-	s.stopping = true
 	s.repairing = true
 	s.status = "正在恢复网络…"
 	s.mu.Unlock()
 
 	go func() {
-		s.svc.Stop()
+		s.stopService()
 		err := proxy.Repair()
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		s.running = false
-		s.starting = false
-		s.stopping = false
 		s.repairing = false
 		if err != nil {
 			s.status = "修复网络失败：" + err.Error()
@@ -182,39 +255,44 @@ func (s *State) repair() {
 	}()
 }
 
-func (s *State) onJobDone(js download.JobSnapshot) {
+func (s *State) onPageConnected(connected bool) {
 	s.mu.Lock()
-	switch js.State {
-	case download.JobDone:
-		s.lastResult = js.Path
+	s.pageConnected = connected
+	s.mu.Unlock()
+}
+
+func (s *State) onDownload(ev sphgui.DownloadEvent) {
+	s.mu.Lock()
+	if ev.Finished {
+		if ev.Path != "" {
+			s.lastResult = ev.Path
+		}
 		s.status = ""
-	case download.JobError:
-		s.status = js.Error
-	case download.JobCanceled:
-		s.status = "下载已取消"
+	} else if ev.Error != "" {
+		s.status = ev.Error
 	}
 	s.mu.Unlock()
 
-	if js.State != download.JobDone {
+	if !ev.Finished || ev.Path == "" {
 		return
 	}
 	if s.windowFocused() {
 		return
 	}
 	note := mygo.NewNotification(mygo.NotificationOptions{
-		ID:    "sph-done-" + js.ID,
+		ID:    fmt.Sprintf("sph-done-%d", ev.TaskID),
 		Title: "下载完成",
-		Body:  filepath.Base(js.Path),
+		Body:  filepath.Base(ev.Path),
 	})
 	note.OnClick(func() {
-		mygo.Shell.ShowItemInFolder(js.Path)
+		mygo.Shell.ShowItemInFolder(ev.Path)
 	})
 	_ = note.Show()
 }
 
 func (s *State) View(c *ui.Context) {
 	status, dir, running, starting, stopping, repairing, lastResult := s.snapshot()
-	info := s.svc.Info()
+	info := s.appSnapshot()
 	t := c.Theme()
 
 	ui.Scroll(c).Fill().Children(func() {
@@ -278,7 +356,7 @@ func (s *State) View(c *ui.Context) {
 }
 
 func (s *State) viewIntro(c *ui.Context) {
-	ui.Text(c, "点「启动」，然后打开电脑版微信 → 视频号。页面右下角会出现下载面板。").
+	ui.Text(c, "点「启动」，然后打开电脑版微信 → 视频号。页面右下角会出现下载按钮，视频号首页右侧也会出现下载入口。").
 		FontSize(14).Wrap()
 }
 
@@ -298,7 +376,7 @@ func (s *State) viewAbout(c *ui.Context, t *ui.Theme) {
 	})
 }
 
-func (s *State) viewRunning(c *ui.Context, t *ui.Theme, info proxy.Info, lastResult string, starting, stopping, repairing bool) {
+func (s *State) viewRunning(c *ui.Context, t *ui.Theme, info sphgui.Snapshot, lastResult string, starting, stopping, repairing bool) {
 	label := "已就绪"
 	color := t.Success
 	if starting {
@@ -324,12 +402,9 @@ func (s *State) viewRunning(c *ui.Context, t *ui.Theme, info proxy.Info, lastRes
 		ui.Text(c, "打开电脑版微信 → 视频号，在页面右下角下载。").
 			FontSize(13).Wrap()
 
-		connected := !info.LastPing.IsZero() && time.Since(info.LastPing) < 15*time.Second
-		if !connected {
+		if !info.PageConnected {
 			ui.Text(c, "等待视频号页面…如果微信已打开，请完全退出后重新打开。").
 				FontSize(12).TextColor(t.Warning).Wrap()
-		} else if !info.FeedSeen {
-			ui.Text(c, "等待视频内容…").FontSize(12).TextColor(t.TextMuted)
 		}
 	}
 
@@ -340,8 +415,8 @@ func (s *State) viewRunning(c *ui.Context, t *ui.Theme, info proxy.Info, lastRes
 			title = "正在下载：" + job.Title
 		}
 		ui.Text(c, title).FontSize(13).Bold().MaxWidth(520).SingleLine().Tooltip(title)
-		if job.Progress >= 0 {
-			ui.Progress(c, job.Progress).Width(520)
+		if job.Fraction >= 0 {
+			ui.Progress(c, job.Fraction).Width(520)
 		} else {
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 				ui.Spinner(c)
@@ -361,7 +436,10 @@ func (s *State) viewRunning(c *ui.Context, t *ui.Theme, info proxy.Info, lastRes
 		})
 	}
 
-	if !info.StartedAt.IsZero() && time.Since(info.StartedAt) > 20*time.Hour {
+	s.mu.Lock()
+	startedAt := s.startedAt
+	s.mu.Unlock()
+	if !startedAt.IsZero() && time.Since(startedAt) > 20*time.Hour {
 		ui.Text(c, "已连续运行 20 小时，建议停止后重新启动。").
 			FontSize(12).TextColor(t.Warning).Wrap()
 	}
@@ -403,11 +481,12 @@ func (s *State) setSaveDir(dir string) {
 	}
 	s.mu.Lock()
 	s.saveDir = dir
+	app := s.svc
 	s.mu.Unlock()
-	s.svc.SetSaveDir(dir)
-	if err := saveSaveDir(dir); err != nil {
-		s.setStatus("已切换保存目录，但无法记住这个设置。")
+	if app != nil {
+		app.SetSaveDir(dir)
 	}
+	s.setStatus("已切换保存目录。")
 }
 
 func testWritable(dir string) error {
@@ -424,13 +503,17 @@ func friendlyStartError(err error) string {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "端口"):
-		return "本地端口被占用，请重启电脑后再试。"
+		return "本地端口被占用，请关闭占用该端口的程序后重试。"
 	case strings.Contains(msg, "证书"):
 		return "无法安装临时证书。请确认程序以管理员身份运行，并检查安全软件的拦截提示。"
 	case strings.Contains(msg, "代理"):
 		return "无法修改系统代理。请检查安全软件是否拦截本程序。"
 	case strings.Contains(msg, "守护"):
 		return "清理进程启动失败。请检查安全软件是否拦截本程序。"
+	case strings.Contains(msg, "数据库"):
+		return "下载数据库初始化失败：" + msg
+	case strings.Contains(msg, "适配器"):
+		return "视频号组件初始化失败：" + msg
 	}
 	return msg
 }
@@ -453,50 +536,4 @@ func defaultSaveDir() string {
 		base = "."
 	}
 	return filepath.Join(base, "视频号")
-}
-
-type savedSettings struct {
-	SaveDir string `json:"saveDir"`
-}
-
-func settingsFile() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(dir, "sphvideo", "settings.json")
-}
-
-func loadSaveDir(def string) string {
-	name := settingsFile()
-	if name == "" {
-		return def
-	}
-	raw, err := os.ReadFile(name)
-	if err != nil {
-		return def
-	}
-	var st savedSettings
-	if json.Unmarshal(raw, &st) != nil {
-		return def
-	}
-	if st.SaveDir == "" || !filepath.IsAbs(st.SaveDir) {
-		return def
-	}
-	return st.SaveDir
-}
-
-func saveSaveDir(dir string) error {
-	name := settingsFile()
-	if name == "" {
-		return fmt.Errorf("no config directory")
-	}
-	if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
-		return err
-	}
-	raw, err := json.Marshal(savedSettings{SaveDir: dir})
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(name, raw, 0o644)
 }

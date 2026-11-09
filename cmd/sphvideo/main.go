@@ -54,7 +54,7 @@ func main() {
 			res, err := mygo.Dialog.Message(mygo.MessageOptions{
 				Type:               mygo.MessageWarning,
 				Title:              "退出会取消下载",
-				Message:            "还有文件正在下载。退出后网络设置会恢复，未完成的文件会被删除。",
+				Message:            "还有文件正在下载。退出后网络设置会恢复，未完成的任务会被取消。",
 				Buttons:            []string{"退出并取消下载", "继续下载"},
 				DefaultButton:      1,
 				CancelButton:       1,

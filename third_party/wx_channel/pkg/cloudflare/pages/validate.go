@@ -1,0 +1,252 @@
+package pages
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"wx_channel/pkg/hash"
+)
+
+func should_ignore(file_path string, ignore_patterns []string) bool {
+	base_name := filepath.Base(file_path)
+	for _, pattern := range ignore_patterns {
+		pattern = strings.TrimPrefix(pattern, "**/")
+		if matched, _ := filepath.Match(pattern, base_name); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// getMimeType returns the appropriate MIME type based on file extension
+func getMimeType(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+
+	switch ext {
+	// Text files
+	case ".html", ".htm":
+		return "text/html"
+	case ".css":
+		return "text/css"
+	case ".js":
+		return "application/javascript"
+	case ".json":
+		return "application/json"
+	case ".xml":
+		return "application/xml"
+	case ".txt":
+		return "text/plain"
+	case ".md":
+		return "text/markdown"
+
+	// Image files
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".svg":
+		return "image/svg+xml"
+	case ".webp":
+		return "image/webp"
+	case ".ico":
+		return "image/x-icon"
+	case ".bmp":
+		return "image/bmp"
+	case ".tiff", ".tif":
+		return "image/tiff"
+
+	// Font files
+	case ".woff":
+		return "font/woff"
+	case ".woff2":
+		return "font/woff2"
+	case ".ttf":
+		return "font/ttf"
+	case ".otf":
+		return "font/otf"
+	case ".eot":
+		return "application/vnd.ms-fontobject"
+
+	// Audio files
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg":
+		return "audio/ogg"
+	case ".m4a":
+		return "audio/mp4"
+
+	// Video files
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".avi":
+		return "video/x-msvideo"
+	case ".mov":
+		return "video/quicktime"
+	case ".wmv":
+		return "video/x-ms-wmv"
+
+	// Archive files
+	case ".zip":
+		return "application/zip"
+	case ".rar":
+		return "application/vnd.rar"
+	case ".7z":
+		return "application/x-7z-compressed"
+	case ".tar":
+		return "application/x-tar"
+	case ".gz":
+		return "application/gzip"
+
+	// Document files
+	case ".pdf":
+		return "application/pdf"
+	case ".doc":
+		return "application/msword"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xls":
+		return "application/vnd.ms-excel"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".ppt":
+		return "application/vnd.ms-powerpoint"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+	// Code files
+	case ".py":
+		return "text/x-python"
+	case ".java":
+		return "text/x-java-source"
+	case ".c":
+		return "text/x-c"
+	case ".cpp", ".cc":
+		return "text/x-c++src"
+	case ".h":
+		return "text/x-c"
+	case ".php":
+		return "application/x-httpd-php"
+	case ".rb":
+		return "text/x-ruby"
+	case ".go":
+		return "text/x-go"
+	case ".rs":
+		return "text/x-rust"
+	case ".swift":
+		return "text/x-swift"
+	case ".kt":
+		return "text/x-kotlin"
+	case ".scala":
+		return "text/x-scala"
+	case ".sh":
+		return "application/x-sh"
+	case ".bat":
+		return "application/x-msdos-program"
+	case ".ps1":
+		return "application/x-powershell"
+
+	// Data files
+	case ".csv":
+		return "text/csv"
+	case ".tsv":
+		return "text/tab-separated-values"
+	case ".yaml", ".yml":
+		return "application/x-yaml"
+	case ".toml":
+		return "application/toml"
+	case ".ini":
+		return "text/plain"
+	case ".conf":
+		return "text/plain"
+	case ".config":
+		return "text/plain"
+
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func walk(dir string, files_map map[string]FileContainer, dir_start string, ignore_patterns []string) error {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("读取 Pages 资源目录 %s 失败: %w", dir, err)
+	}
+
+	for _, file := range files {
+		file_path := filepath.Join(dir, file.Name())
+		relative_filepath, err := filepath.Rel(dir_start, file_path)
+		if err != nil {
+			return fmt.Errorf("计算 Pages 资源相对路径 %s 失败: %w", file_path, err)
+		}
+
+		// Check if this file/directory should be ignored
+		if should_ignore(file_path, ignore_patterns) {
+			continue
+		}
+
+		if file.IsDir() {
+			if err := walk(file_path, files_map, dir_start, ignore_patterns); err != nil {
+				return err
+			}
+		} else {
+			info, err := file.Info()
+			if err != nil {
+				return fmt.Errorf("读取 Pages 资源信息 %s 失败: %w", file_path, err)
+			}
+
+			file_hash, err := hash.FileHashWithExtension(file_path)
+			if err != nil {
+				return fmt.Errorf("计算 Pages 资源哈希 %s 失败: %w", file_path, err)
+			}
+
+			container := FileContainer{
+				Filename:    file.Name(),
+				Path:        file_path,
+				SizeInBytes: int(info.Size()),
+				ContentType: getMimeType(file.Name()),
+				Hash:        file_hash,
+			}
+
+			files_map[relative_filepath] = container
+		}
+	}
+	return nil
+}
+
+func Validate(directory string) (map[string]FileContainer, error) {
+	ignore_files := []string{
+		"_worker.js",
+		"_redirects",
+		"_headers",
+		"_routes.json",
+		"functions",
+		"**/.DS_Store",
+		"**/node_modules",
+		"**/.git",
+	}
+	directory_info, err := os.Stat(directory)
+	if err != nil {
+		return nil, fmt.Errorf("读取 Pages 资源目录 %s 失败: %w", directory, err)
+	}
+	if !directory_info.IsDir() {
+		return nil, fmt.Errorf("Pages 资源路径不是目录: %s", directory)
+	}
+	abs_filepath, err := filepath.Abs(directory)
+	if err != nil {
+		return nil, fmt.Errorf("获取 Pages 资源目录绝对路径失败: %w", err)
+	}
+
+	file_map := make(map[string]FileContainer)
+	if err := walk(abs_filepath, file_map, abs_filepath, ignore_files); err != nil {
+		return nil, err
+	}
+	return file_map, nil
+}

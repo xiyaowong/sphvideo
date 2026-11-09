@@ -1,0 +1,116 @@
+debug:
+  error: false
+  echolog: false
+
+workdir: ""
+
+download:
+  filenameTemplate: "{{filename}}_{{spec}}"
+  dir: "%UserDownloads%"
+  playDoneAudio: true
+  defaultActionWhenExisting: ""
+  maxRunning: 3
+  resourceConcurrency: 100
+  segmentConcurrency: 10
+  connectionConcurrency: 0 # 0 derives resourceConcurrency * segmentConcurrency
+  remoteServer:
+    enabled: false
+    protocol: "http"
+    hostname: "192.168.1.2"
+    port: 2022
+
+api:
+  protocol: "http"
+  hostname: "127.0.0.1"
+  port: 2022
+
+mcp:
+  enabled: false
+
+scraper:
+  retainedJobs: 20
+
+db:
+  type: "sqlite"
+  host: ""
+  port: ""
+  username: ""
+  password: ""
+  filename: ""
+  filepath: "%CWD%/data.db"
+
+proxy:
+  enabled: true
+  system: true
+  hostname: "127.0.0.1"
+  port: 2023
+  tcpRelay:
+    enabled: false
+    hostname: "127.0.0.1"
+    port: 9900
+  tun: false
+  defaultInterface: ""
+  skipInstallRootCert: false
+  upstreamProxy: ""
+
+cookie:
+  uuid: ""
+  password: ""
+  key: ""
+
+update:
+  sources:
+    - type: github
+      priority: 1
+      github_repo: ltaoo/wx_channels_download
+      github_token: ""
+      manifest_url: ""
+      self_url: ""
+      enabled: true
+      need_check_checksum: false
+  proxy: ""
+  mirror: ""
+
+channels:
+  disableLocationToHome: false
+  download:
+    defaultHighest: false
+    frontend: false
+    cover: false
+    pauseWhenDownload: false
+    forceCheckAllFeeds: false
+
+mp:
+  remoteServer:
+    protocol: "http"
+    hostname: ""
+    port: 80
+  refreshToken: "wx_channels_download"
+  tokenFilepath: ""
+  refreshSkipMinutes: 20
+  maxWebsocketClients: 5
+
+cloudflare:
+  accountId: ""
+  apiToken: ""
+  refreshToken: "wx_channels_download"
+  adminToken: ""
+  workerName: "mp-rss-api"
+  d1Name: "mp-rss-db"
+  sphWorkerName: "sph"
+  sphCookie: ""
+  sphCredential: ""
+
+bridge:
+  deploy:
+    workerName: "dm-bridge"
+    pagesProjectName: ""
+    token: ""
+    adminToken: ""
+  enabled: false
+  url: "https://dm-bridge.example.workers.dev"
+  deviceId: ""
+  deviceName: ""
+  token: ""
+  httpTimeoutSeconds: 30
+  methods: "auto"

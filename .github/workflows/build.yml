@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GOFLAGS: "-tags=embed_inject,embed_frontend_inject,sqlite_only"
+
 jobs:
   windows:
     runs-on: ubuntu-latest

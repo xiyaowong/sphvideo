@@ -17,7 +17,9 @@
 - https://github.com/ltaoo/wx_channels_download
 - MIT + Commons Clause
 - Copyright (c) 2025 ltaoo
-- Reference for the download method and parts of the injection/decryption logic.
+- Vendored at commit `c7d15d7e055a62090d6a98694cc986812f8d86f4` under
+  `third_party/wx_channel`. Used for the interception, page runtime, and
+  download engine; the admin frontend and unrelated platforms are excluded.
 
 Commons Clause condition:
 

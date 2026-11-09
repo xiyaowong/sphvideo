@@ -1,0 +1,1639 @@
+package services
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+
+	"wx_channel/internal/database/model"
+)
+
+type ContentService struct {
+	db *gorm.DB
+}
+
+func NewContentService(db *gorm.DB) *ContentService {
+	return &ContentService{
+		db: db,
+	}
+}
+
+func (s *ContentService) DB() *gorm.DB {
+	return s.db
+}
+
+// UpsertAccountAndLinkContent saves an account and establishes a content association in content_account.
+// When content_id is empty, only the account is saved.
+func (s *ContentService) UpsertAccountAndLinkContent(content_id string, account *model.Account, role string, now int64) (*model.Account, error) {
+	if s.db == nil {
+		return nil, ErrDBNotInitialized
+	}
+	if account == nil {
+		return nil, fmt.Errorf("account is nil")
+	}
+	if strings.TrimSpace(account.PlatformId) == "" || strings.TrimSpace(account.ExternalId) == "" {
+		return nil, fmt.Errorf("account platform_id and external_id are required")
+	}
+	if now <= 0 {
+		now = time.Now().UnixMilli()
+	}
+	role = strings.TrimSpace(role)
+	if role == "" {
+		role = "owner"
+	}
+
+	var persisted model.Account
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		err := tx.
+			Where("platform_id = ? AND external_id = ? AND deleted_at IS NULL", account.PlatformId, account.ExternalId).
+			First(&persisted).Error
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			persisted = *account
+			// Avatar history is maintained internally from observed changes. A
+			// newly created account has no previous avatar regardless of caller
+			// input.
+			persisted.PastAvatars = "[]"
+			if persisted.CreatedAt == 0 {
+				persisted.CreatedAt = now
+			}
+			persisted.UpdatedAt = now
+			if err := tx.Create(&persisted).Error; err != nil {
+				return fmt.Errorf("保存账号失败: %w", err)
+			}
+		case err != nil:
+			return fmt.Errorf("查询账号失败: %w", err)
+		default:
+			updates, err := account_updates(&persisted, account, now)
+			if err != nil {
+				return fmt.Errorf("更新账号头像历史失败: %w", err)
+			}
+			if len(updates) > 0 {
+				if err := tx.Model(&persisted).Updates(updates).Error; err != nil {
+					return fmt.Errorf("更新账号失败: %w", err)
+				}
+				if err := tx.Where("id = ?", persisted.Id).First(&persisted).Error; err != nil {
+					return fmt.Errorf("读取更新后的账号失败: %w", err)
+				}
+			}
+		}
+
+		content_id = strings.TrimSpace(content_id)
+		if content_id == "" {
+			return nil
+		}
+
+		var association model.ContentAccount
+		err = tx.
+			Where("content_id = ? AND account_id = ?", content_id, persisted.Id).
+			First(&association).Error
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			association = model.ContentAccount{
+				ContentId: content_id,
+				AccountId: persisted.Id,
+				Role:      role,
+				CreatedAt: now,
+			}
+			if err := tx.Create(&association).Error; err != nil {
+				return fmt.Errorf("创建 content_account 关联失败: %w", err)
+			}
+		case err != nil:
+			return fmt.Errorf("查询 content_account 关联失败: %w", err)
+		case association.Role != role:
+			if err := tx.Model(&association).Update("role", role).Error; err != nil {
+				return fmt.Errorf("更新 content_account 关联失败: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &persisted, nil
+}
+
+func account_updates(existing *model.Account, account *model.Account, now int64) (map[string]any, error) {
+	updates := map[string]any{"updated_at": now}
+	if account.InfluencerId != nil {
+		updates["influencer_id"] = account.InfluencerId
+	}
+	if account.Alias != "" {
+		updates["alias"] = account.Alias
+	}
+	if account.Nickname != "" {
+		updates["nickname"] = account.Nickname
+	}
+	if account.Signature != "" {
+		updates["signature"] = account.Signature
+	}
+	avatar_changed, err := existing.ApplyObservedAvatarURL(account.AvatarURL)
+	if err != nil {
+		return nil, err
+	}
+	if avatar_changed {
+		updates["avatar_url"] = existing.AvatarURL
+		updates["past_avatars"] = existing.PastAvatars
+	}
+	if account.ProfileURL != "" {
+		updates["profile_url"] = account.ProfileURL
+	}
+	if account.IsListen != 0 {
+		updates["is_listen"] = account.IsListen
+	}
+	if account.FollowerCount != 0 {
+		updates["follower_count"] = account.FollowerCount
+	}
+	if account.PastNames != "" {
+		updates["past_names"] = account.PastNames
+	}
+	return updates, nil
+}
+
+type ContentListOptions struct {
+	AccountID  string
+	PlatformID string
+	Type       string
+	Scope      string
+	Keyword    string
+	StartAt    *int64 // Inclusive Unix timestamp in milliseconds.
+	EndAt      *int64 // Exclusive Unix timestamp in milliseconds.
+	Page       int
+	PageSize   int
+	Offset     *int
+}
+
+const (
+	ContentListScopeAll  = "all"
+	ContentListScopeTask = "task"
+)
+
+type ContentAccountRecord struct {
+	ID            string `json:"id"`
+	PlatformID    string `json:"platform_id"`
+	InfluencerID  *int   `json:"influencer_id,omitempty"`
+	ExternalID    string `json:"external_id"`
+	Alias         string `json:"alias"`
+	Nickname      string `json:"nickname"`
+	Signature     string `json:"signature"`
+	AvatarURL     string `json:"avatar_url"`
+	ProfileURL    string `json:"profile_url"`
+	IsListen      int    `json:"is_listen"`
+	FollowerCount int64  `json:"follower_count"`
+	PastNames     string `json:"past_names"`
+	PastAvatars   string `json:"past_avatars"`
+	Role          string `json:"role"`
+	CreatedAt     int64  `json:"created_at"`
+	UpdatedAt     int64  `json:"updated_at"`
+}
+
+type ContentDownloadTaskRecord struct {
+	ID           int     `json:"id"`
+	ContentID    *string `json:"content_id,omitempty"`
+	ParentTaskID *int    `json:"parent_task_id,omitempty"`
+	RootTaskID   int     `json:"root_task_id"`
+	RelationType string  `json:"relation_type,omitempty"`
+	Name         string  `json:"name"`
+	PlatformID   string  `json:"platform_id"`
+	Status       int     `json:"status"`
+	SourceURL    string  `json:"source_url"`
+	CoverURL     string  `json:"cover_url"`
+	CoverWidth   string  `json:"cover_width"`
+	CoverHeight  string  `json:"cover_height"`
+	Error        string  `json:"error"`
+	CreatedAt    int64   `json:"created_at"`
+	UpdatedAt    int64   `json:"updated_at"`
+}
+
+type ContentResourceRecord struct {
+	ID            int     `json:"id"`
+	TaskID        *int    `json:"task_id,omitempty"`
+	ContentID     *string `json:"content_id,omitempty"`
+	DownloadDir   string  `json:"download_dir"`
+	Name          string  `json:"name"`
+	Kind          string  `json:"kind"`
+	UniqueID      string  `json:"unique_id"`
+	Type          string  `json:"type"`
+	URL           string  `json:"url"`
+	Size          int64   `json:"size"`
+	Downloaded    int64   `json:"downloaded"`
+	Speed         int64   `json:"speed"`
+	Status        int     `json:"status"`
+	MergeOrder    int     `json:"merge_order"`
+	Extra         string  `json:"extra"`
+	StreamURL     string  `json:"stream_url"`
+	RecordStart   *int64  `json:"record_start"`
+	RecordEnd     *int64  `json:"record_end"`
+	Duration      int64   `json:"duration"`
+	RotateMinutes int     `json:"rotate_minutes"`
+	RotateSize    int64   `json:"rotate_size"`
+	StartTime     *int64  `json:"start_time"`
+	FinishTime    *int64  `json:"finish_time"`
+	CreatedAt     int64   `json:"created_at"`
+	UpdatedAt     int64   `json:"updated_at"`
+}
+
+// ContentInfluencerRecord exposes one person-role association attached to a
+// content item. A person may appear multiple times with different Role values.
+type ContentInfluencerRecord struct {
+	ID                 int     `json:"id"`
+	Name               string  `json:"name"`
+	Alias              string  `json:"alias"`
+	AvatarURL          string  `json:"avatar_url"`
+	Sex                int     `json:"sex"`
+	Description        string  `json:"description"`
+	Biography          string  `json:"biography"`
+	ProfilePath        string  `json:"profile_path"`
+	Birthday           string  `json:"birthday"`
+	PlaceOfBirth       string  `json:"place_of_birth"`
+	KnownForDepartment string  `json:"known_for_department"`
+	Profile            string  `json:"profile"`
+	TMDBId             *string `json:"tmdb_id,omitempty"`
+	DoubanId           *string `json:"douban_id,omitempty"`
+	IMDBId             *string `json:"imdb_id,omitempty"`
+	Role               string  `json:"role"`
+	SortOrder          int     `json:"sort_order"`
+	RoleMetadataJSON   string  `json:"role_metadata_json"`
+	MetadataJSON       string  `json:"metadata_json"`
+	CreatedAt          int64   `json:"created_at"`
+	UpdatedAt          int64   `json:"updated_at"`
+}
+
+type ContentListItem struct {
+	ID            string                      `json:"id"`
+	PlatformID    string                      `json:"platform_id"`
+	Type          string                      `json:"type"`
+	Subtype       string                      `json:"subtype"`
+	ExternalID    string                      `json:"external_id"`
+	ExternalID2   string                      `json:"external_id2"`
+	ExternalID3   string                      `json:"external_id3"`
+	Title         string                      `json:"title"`
+	Description   string                      `json:"description"`
+	URL           string                      `json:"url"`
+	SourceURL     string                      `json:"source_url"`
+	CoverURL      string                      `json:"cover_url"`
+	CoverWidth    string                      `json:"cover_width"`
+	CoverHeight   string                      `json:"cover_height"`
+	PublishTime   int64                       `json:"publish_time"`
+	CreatedAt     int64                       `json:"created_at"`
+	Accounts      []ContentAccountRecord      `json:"accounts"`
+	Influencers   []ContentInfluencerRecord   `json:"influencers"`
+	DownloadTasks []ContentDownloadTaskRecord `json:"download_tasks"`
+	FileCount     int64                       `json:"file_count"`
+}
+
+const (
+	ContentRelationDirectionBoth     = "both"
+	ContentRelationDirectionIncoming = "incoming"
+	ContentRelationDirectionOutgoing = "outgoing"
+)
+
+type ContentRelationListOptions struct {
+	ContentID string
+	Direction string
+	Type      string
+	Page      int
+	PageSize  int
+	Offset    *int
+}
+
+// ContentRelationContentRecord is the independently addressable content at
+// the other end of a relationship.
+type ContentRelationContentRecord struct {
+	ID          string `json:"id"`
+	PlatformID  string `json:"platform_id"`
+	Type        string `json:"type"`
+	Subtype     string `json:"subtype"`
+	ExternalID  string `json:"external_id"`
+	ExternalID2 string `json:"external_id2"`
+	ExternalID3 string `json:"external_id3"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	URL         string `json:"url"`
+	SourceURL   string `json:"source_url"`
+	CoverURL    string `json:"cover_url"`
+	PublishTime int64  `json:"publish_time"`
+	UpdateTime  int64  `json:"update_time"`
+}
+
+// ContentRelationRecord describes one relation relative to the requested
+// content. Direction is incoming when related content points to the requested
+// content, and outgoing when the requested content points to related content.
+type ContentRelationRecord struct {
+	SourceContentID string                       `json:"source_content_id"`
+	TargetContentID string                       `json:"target_content_id"`
+	RelationType    string                       `json:"relation_type"`
+	Direction       string                       `json:"direction"`
+	SortOrder       int                          `json:"sort_order"`
+	Metadata        string                       `json:"metadata"`
+	CreatedAt       int64                        `json:"created_at"`
+	Content         ContentRelationContentRecord `json:"content"`
+}
+
+type ContentRelationListResult struct {
+	List     []ContentRelationRecord `json:"list"`
+	Total    int64                   `json:"total"`
+	Page     int                     `json:"page"`
+	PageSize int                     `json:"page_size"`
+}
+
+type ContentDetailItem struct {
+	ContentListItem
+	Content          model.Content               `json:"content"`
+	Resources        []ContentResourceRecord     `json:"resources"`
+	DetailType       string                      `json:"detail_type"`
+	Detail           any                         `json:"detail"`
+	EmbeddedContents []ContentEmbeddedDetailItem `json:"embedded_contents"`
+	Relations        ContentRelationListResult   `json:"relations"`
+}
+
+// ContentEmbeddedDetailItem exposes the extension data for media directly
+// contained by an article, post, or album. The media remains independently
+// addressable while clients can render its assets as part of the parent.
+type ContentEmbeddedDetailItem struct {
+	RelationType string        `json:"relation_type"`
+	SortOrder    int           `json:"sort_order"`
+	Content      model.Content `json:"content"`
+	DetailType   string        `json:"detail_type"`
+	Detail       any           `json:"detail"`
+}
+
+var embedded_content_parent_types = []string{
+	model.ContentTypeAlbum,
+	model.ContentTypeArticle,
+	model.ContentTypePost,
+	model.ContentTypeWebpage,
+	"blog",
+	"question",
+	"answer",
+	"news",
+	"newsletter",
+}
+
+var embedded_content_media_types = []string{
+	model.ContentTypeVideo,
+	model.ContentTypeAudio,
+	model.ContentTypeImage,
+	model.ContentTypeAlbum,
+	model.ContentTypeDocument,
+	model.ContentTypeOther,
+	"short_video",
+	"image_set",
+	"music",
+	"audiobook",
+}
+
+func content_supports_embedded_media(content_type string) bool {
+	content_type = strings.ToLower(strings.TrimSpace(content_type))
+	for _, candidate := range embedded_content_parent_types {
+		if content_type == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// Keep list totals and account counts consistent with embedded detail rendering.
+// Existing child records stay addressable and need no data migration.
+func exclude_embedded_contents(query *gorm.DB) *gorm.DB {
+	return query.Where(`NOT EXISTS (
+		SELECT 1 FROM content_relation AS relation
+		JOIN content AS parent ON parent.id = relation.source_content_id
+		WHERE relation.target_content_id = content.id AND relation.type = ?
+			AND parent.id <> content.id AND parent.deleted_at IS NULL
+			AND parent.type IN ? AND content.type IN ?
+	)`, model.ContentRelationContains, embedded_content_parent_types, embedded_content_media_types)
+}
+
+type ContentListResult struct {
+	List     []ContentListItem `json:"list"`
+	Total    int64             `json:"total"`
+	Page     int               `json:"page"`
+	PageSize int               `json:"page_size"`
+}
+
+func sort_content_resources(resources []ContentResourceRecord, content_type string) {
+	is_album := content_type == model.ContentTypeAlbum || content_type == "image_set"
+	sort.SliceStable(resources, func(left_index, right_index int) bool {
+		left := resources[left_index]
+		right := resources[right_index]
+		if is_album && left.MergeOrder != right.MergeOrder {
+			return left.MergeOrder < right.MergeOrder
+		}
+		if left.CreatedAt != right.CreatedAt {
+			return left.CreatedAt > right.CreatedAt
+		}
+		return left.ID > right.ID
+	})
+}
+
+// load_content_relations loads accounts, influencers, download tasks, and,
+// when requested, resources for the given content IDs. It is shared by
+// ListContents and GetContentDetail.
+func (s *ContentService) load_content_relations(content_ids []string, include_resources bool) (
+	map[string][]ContentAccountRecord,
+	map[string][]ContentInfluencerRecord,
+	map[string][]ContentDownloadTaskRecord,
+	map[string][]ContentResourceRecord,
+	error,
+) {
+	accounts_by_content_id := make(map[string][]ContentAccountRecord, len(content_ids))
+	influencers_by_content_id := make(map[string][]ContentInfluencerRecord, len(content_ids))
+	download_tasks_by_content_id := make(map[string][]ContentDownloadTaskRecord, len(content_ids))
+	resources_by_content_id := make(map[string][]ContentResourceRecord, len(content_ids))
+
+	if len(content_ids) == 0 {
+		return accounts_by_content_id, influencers_by_content_id, download_tasks_by_content_id, resources_by_content_id, nil
+	}
+
+	type content_account_row struct {
+		ContentID     string `gorm:"column:content_id"`
+		AccountID     string `gorm:"column:account_id"`
+		Role          string `gorm:"column:role"`
+		PlatformID    string `gorm:"column:platform_id"`
+		InfluencerID  *int   `gorm:"column:influencer_id"`
+		ExternalID    string `gorm:"column:external_id"`
+		Alias         string `gorm:"column:alias"`
+		Nickname      string `gorm:"column:nickname"`
+		Signature     string `gorm:"column:signature"`
+		AvatarURL     string `gorm:"column:avatar_url"`
+		ProfileURL    string `gorm:"column:profile_url"`
+		IsListen      int    `gorm:"column:is_listen"`
+		FollowerCount int64  `gorm:"column:follower_count"`
+		PastNames     string `gorm:"column:past_names"`
+		PastAvatars   string `gorm:"column:past_avatars"`
+		CreatedAt     int64  `gorm:"column:created_at"`
+		UpdatedAt     int64  `gorm:"column:updated_at"`
+	}
+	var rows []content_account_row
+	if err := s.db.Table("content_account").
+		Select(`content_account.content_id, content_account.account_id, content_account.role,
+			account.platform_id, account.influencer_id, account.external_id, account.alias,
+			account.nickname, account.signature, account.avatar_url, account.profile_url,
+			account.is_listen, account.follower_count, account.past_names, account.past_avatars,
+			account.created_at, account.updated_at`).
+		Joins("JOIN account ON account.id = content_account.account_id").
+		Where("content_account.content_id IN ? AND account.deleted_at IS NULL", content_ids).
+		Order("content_account.content_id ASC, content_account.account_id ASC").
+		Scan(&rows).Error; err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	type content_influencer_row struct {
+		ContentID          string  `gorm:"column:content_id"`
+		InfluencerID       int     `gorm:"column:influencer_id"`
+		Role               string  `gorm:"column:role"`
+		SortOrder          int     `gorm:"column:sort_order"`
+		RoleMetadataJSON   string  `gorm:"column:role_metadata_json"`
+		Name               string  `gorm:"column:name"`
+		Alias              string  `gorm:"column:alias"`
+		AvatarURL          string  `gorm:"column:avatar_url"`
+		Sex                int     `gorm:"column:sex"`
+		Description        string  `gorm:"column:description"`
+		Biography          string  `gorm:"column:biography"`
+		ProfilePath        string  `gorm:"column:profile_path"`
+		Birthday           string  `gorm:"column:birthday"`
+		PlaceOfBirth       string  `gorm:"column:place_of_birth"`
+		KnownForDepartment string  `gorm:"column:known_for_department"`
+		Profile            string  `gorm:"column:profile"`
+		TMDBId             *string `gorm:"column:tmdb_id"`
+		DoubanId           *string `gorm:"column:douban_id"`
+		IMDBId             *string `gorm:"column:imdb_id"`
+		MetadataJSON       string  `gorm:"column:metadata_json"`
+		CreatedAt          int64   `gorm:"column:created_at"`
+		UpdatedAt          int64   `gorm:"column:updated_at"`
+	}
+	var influencer_rows []content_influencer_row
+	if err := s.db.Table("content_influencer").
+		Select(`content_influencer.content_id, content_influencer.influencer_id,
+			content_influencer.role, content_influencer.sort_order,
+			content_influencer.metadata_json AS role_metadata_json,
+			influencer.name, influencer.alias, influencer.avatar_url, influencer.sex,
+			influencer.description, influencer.biography, influencer.profile_path,
+			influencer.birthday, influencer.place_of_birth,
+			influencer.known_for_department, influencer.profile,
+			influencer.tmdb_id, influencer.douban_id, influencer.imdb_id,
+			influencer.metadata_json, content_influencer.created_at,
+			content_influencer.updated_at`).
+		Joins("JOIN influencer ON influencer.id = content_influencer.influencer_id").
+		Where("content_influencer.content_id IN ? AND influencer.deleted_at IS NULL", content_ids).
+		Order("content_influencer.content_id ASC, content_influencer.sort_order ASC, content_influencer.influencer_id ASC, content_influencer.role ASC").
+		Scan(&influencer_rows).Error; err != nil {
+		return nil, nil, nil, nil, err
+	}
+	for _, row := range influencer_rows {
+		influencers_by_content_id[row.ContentID] = append(influencers_by_content_id[row.ContentID], ContentInfluencerRecord{
+			ID:                 row.InfluencerID,
+			Name:               row.Name,
+			Alias:              row.Alias,
+			AvatarURL:          row.AvatarURL,
+			Sex:                row.Sex,
+			Description:        row.Description,
+			Biography:          row.Biography,
+			ProfilePath:        row.ProfilePath,
+			Birthday:           row.Birthday,
+			PlaceOfBirth:       row.PlaceOfBirth,
+			KnownForDepartment: row.KnownForDepartment,
+			Profile:            row.Profile,
+			TMDBId:             row.TMDBId,
+			DoubanId:           row.DoubanId,
+			IMDBId:             row.IMDBId,
+			Role:               row.Role,
+			SortOrder:          row.SortOrder,
+			RoleMetadataJSON:   row.RoleMetadataJSON,
+			MetadataJSON:       row.MetadataJSON,
+			CreatedAt:          row.CreatedAt,
+			UpdatedAt:          row.UpdatedAt,
+		})
+	}
+	for _, row := range rows {
+		accounts_by_content_id[row.ContentID] = append(accounts_by_content_id[row.ContentID], ContentAccountRecord{
+			ID:            row.AccountID,
+			PlatformID:    row.PlatformID,
+			InfluencerID:  row.InfluencerID,
+			ExternalID:    row.ExternalID,
+			Alias:         row.Alias,
+			Nickname:      row.Nickname,
+			Signature:     row.Signature,
+			AvatarURL:     row.AvatarURL,
+			ProfileURL:    row.ProfileURL,
+			IsListen:      row.IsListen,
+			FollowerCount: row.FollowerCount,
+			PastNames:     row.PastNames,
+			PastAvatars:   row.PastAvatars,
+			Role:          row.Role,
+			CreatedAt:     row.CreatedAt,
+			UpdatedAt:     row.UpdatedAt,
+		})
+	}
+
+	var tasks []model.DownloadTask
+	if err := s.db.
+		Select(`id, content_id, parent_task_id, root_task_id, relation_type, name,
+			platform_id, status, source_url, cover_url, cover_width, cover_height,
+			error_message, created_at, updated_at`).
+		Where("content_id IN ? AND deleted_at IS NULL", content_ids).
+		Order("content_id ASC, id DESC").
+		Find(&tasks).Error; err != nil {
+		return nil, nil, nil, nil, err
+	}
+	for _, task := range tasks {
+		if task.ContentId == nil {
+			continue
+		}
+		download_tasks_by_content_id[*task.ContentId] = append(
+			download_tasks_by_content_id[*task.ContentId],
+			ContentDownloadTaskRecord{
+				ID:           task.Id,
+				ContentID:    task.ContentId,
+				ParentTaskID: task.ParentTaskID,
+				RootTaskID:   task.RootTaskID,
+				RelationType: task.RelationType,
+				Name:         task.Name,
+				PlatformID:   task.PlatformId,
+				Status:       task.Status,
+				SourceURL:    task.SourceURL,
+				CoverURL:     task.CoverURL,
+				CoverWidth:   task.CoverWidth,
+				CoverHeight:  task.CoverHeight,
+				Error:        task.ErrorMessage,
+				CreatedAt:    task.CreatedAt,
+				UpdatedAt:    task.UpdatedAt,
+			},
+		)
+	}
+	if !include_resources {
+		return accounts_by_content_id, influencers_by_content_id, download_tasks_by_content_id, resources_by_content_id, nil
+	}
+
+	var resources []model.DownloadResource
+	if err := s.db.
+		Where("content_id IN ? AND deleted_at IS NULL", content_ids).
+		Order("content_id ASC, merge_order ASC").
+		Find(&resources).Error; err != nil {
+		return nil, nil, nil, nil, err
+	}
+	resource_ids := make([]int, 0, len(resources))
+	for _, r := range resources {
+		resource_ids = append(resource_ids, r.Id)
+	}
+	url_by_resource_id := make(map[int]string, len(resource_ids))
+	if len(resource_ids) > 0 {
+		type endpoint_row struct {
+			ResourceID int    `gorm:"column:resource_id"`
+			URL        string `gorm:"column:url"`
+		}
+		var endpoints []endpoint_row
+		if err := s.db.Table("download_endpoint").
+			Select("resource_id, url").
+			Where("resource_id IN ? AND deleted_at IS NULL AND enabled = 1", resource_ids).
+			Order("resource_id ASC, priority ASC, id ASC").
+			Scan(&endpoints).Error; err != nil {
+			return nil, nil, nil, nil, err
+		}
+		for _, ep := range endpoints {
+			if _, exists := url_by_resource_id[ep.ResourceID]; !exists {
+				url_by_resource_id[ep.ResourceID] = ep.URL
+			}
+		}
+	}
+	for _, r := range resources {
+		if r.ContentId == nil {
+			continue
+		}
+		resource_url := url_by_resource_id[r.Id]
+		if resource_url == "" {
+			resource_url = r.StreamURL
+		}
+		resources_by_content_id[*r.ContentId] = append(
+			resources_by_content_id[*r.ContentId],
+			ContentResourceRecord{
+				ID:            r.Id,
+				TaskID:        r.TaskId,
+				ContentID:     r.ContentId,
+				DownloadDir:   r.DownloadDir,
+				Name:          r.Name,
+				Kind:          r.Kind,
+				UniqueID:      r.UniqueID,
+				Type:          r.Type,
+				URL:           resource_url,
+				Size:          r.Size,
+				Downloaded:    r.Downloaded,
+				Speed:         r.Speed,
+				Status:        r.Status,
+				MergeOrder:    r.MergeOrder,
+				Extra:         r.Extra,
+				StreamURL:     r.StreamURL,
+				RecordStart:   r.RecordStart,
+				RecordEnd:     r.RecordEnd,
+				Duration:      r.Duration,
+				RotateMinutes: r.RotateMinutes,
+				RotateSize:    r.RotateSize,
+				StartTime:     r.StartTime,
+				FinishTime:    r.FinishTime,
+				CreatedAt:     r.CreatedAt,
+				UpdatedAt:     r.UpdatedAt,
+			},
+		)
+	}
+
+	return accounts_by_content_id, influencers_by_content_id, download_tasks_by_content_id, resources_by_content_id, nil
+}
+
+func (s *ContentService) load_content_extension(content model.Content) (string, any, error) {
+	content_type := strings.ToLower(strings.TrimSpace(content.Type))
+	content_subtype := strings.ToLower(strings.TrimSpace(content.Subtype))
+	find := func(detail any) (any, error) {
+		if err := s.db.Where("id = ?", content.Id).First(detail).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return detail, nil
+	}
+	if content_subtype == model.ContentSubtypeEpisode {
+		detail, err := find(&model.ContentEpisode{})
+		if err != nil {
+			return "content_episode", nil, err
+		}
+		if detail != nil {
+			return "content_episode", detail, nil
+		}
+	}
+	if content_type == model.ContentTypeCollection && content_subtype == model.ContentSubtypeSeries {
+		detail, err := find(&model.ContentSeries{})
+		if err != nil {
+			return "content_series", nil, err
+		}
+		if detail != nil {
+			return "content_series", detail, nil
+		}
+	}
+
+	switch content_type {
+	case "video", "short_video":
+		var detail model.ContentVideo
+		if err := s.db.
+			Preload("Variants", func(db *gorm.DB) *gorm.DB {
+				return db.Where("deleted_at IS NULL").Order("created_at DESC, asset_id DESC")
+			}).
+			Preload("Variants.Asset", "deleted_at IS NULL").
+			Preload("Variants.Asset.DownloadResources", func(db *gorm.DB) *gorm.DB {
+				return db.Where("deleted_at IS NULL").Order("created_at DESC, id DESC")
+			}).
+			Where("id = ? AND deleted_at IS NULL", content.Id).
+			First(&detail).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return "content_video", nil, nil
+			}
+			return "content_video", nil, err
+		}
+		return "content_video", &detail, nil
+	case "image", "image_set", "album":
+		var detail model.ContentAlbum
+		if err := s.db.
+			Preload("Images", func(db *gorm.DB) *gorm.DB {
+				return db.Where("deleted_at IS NULL").Order("sort_order ASC, id ASC")
+			}).
+			Where("id = ?", content.Id).
+			First(&detail).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return "content_album", nil, nil
+			}
+			return "content_album", nil, err
+		}
+		if err := s.load_content_album_image_assets(&detail); err != nil {
+			return "content_album", nil, err
+		}
+		return "content_album", &detail, nil
+	case "audio", "music", "audiobook":
+		detail, err := find(&model.ContentAudio{})
+		return "content_audio", detail, err
+	case "article", "blog", "question", "answer", "news", "newsletter", "webpage":
+		detail, err := find(&model.ContentArticle{})
+		return "content_article", detail, err
+	case "live":
+		detail, err := find(&model.ContentLive{})
+		return "content_live", detail, err
+	case "novel":
+		var detail model.ContentNovel
+		if err := s.db.
+			Preload("Volumes", func(db *gorm.DB) *gorm.DB {
+				return db.Order("idx ASC, id ASC")
+			}).
+			Preload("Chapters", func(db *gorm.DB) *gorm.DB {
+				return db.Order("idx ASC, id ASC")
+			}).
+			Where("id = ?", content.Id).
+			First(&detail).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return "content_novel", nil, nil
+			}
+			return "content_novel", nil, err
+		}
+		if err := s.load_content_novel_chapter_assets(&detail); err != nil {
+			return "content_novel", nil, err
+		}
+		return "content_novel", &detail, nil
+	case "podcast":
+		detail, err := find(&model.ContentPodcast{})
+		return "content_podcast", detail, err
+	case "document":
+		detail, err := find(&model.ContentDocument{})
+		return "content_document", detail, err
+	case "course":
+		detail, err := find(&model.ContentCourse{})
+		return "content_course", detail, err
+	case "comic":
+		detail, err := find(&model.ContentComic{})
+		return "content_comic", detail, err
+	case "post":
+		detail, err := find(&model.ContentPost{})
+		return "content_post", detail, err
+	case "conversation", "chat", "ai_chat", "human_chat", "email_thread":
+		var detail model.ContentConversation
+		if err := s.db.
+			Preload("Branches", func(db *gorm.DB) *gorm.DB {
+				return db.Where("deleted_at IS NULL").Order("is_current DESC, sort_order ASC, id ASC")
+			}).
+			Preload("Messages", func(db *gorm.DB) *gorm.DB {
+				return db.Where("deleted_at IS NULL").Order("sequence ASC, id ASC")
+			}).
+			Preload("Messages.Parts", func(db *gorm.DB) *gorm.DB {
+				return db.Where("deleted_at IS NULL").Order("sort_order ASC, id ASC")
+			}).
+			Where("id = ?", content.Id).
+			First(&detail).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return "content_conversation", nil, nil
+			}
+			return "content_conversation", nil, err
+		}
+		if err := s.load_content_conversation_assets(&detail); err != nil {
+			return "content_conversation", nil, err
+		}
+		return "content_conversation", &detail, nil
+	default:
+		return "", nil, nil
+	}
+}
+
+func (s *ContentService) load_content_conversation_assets(content_conversation *model.ContentConversation) error {
+	if content_conversation == nil || len(content_conversation.Messages) == 0 {
+		return nil
+	}
+
+	message_keys := make([]string, 0, len(content_conversation.Messages))
+	part_subject_keys := make([]string, 0)
+	for message_index := range content_conversation.Messages {
+		message := &content_conversation.Messages[message_index]
+		if message_key := strings.TrimSpace(message.MessageKey); message_key != "" {
+			message_keys = append(message_keys, message_key)
+		}
+		for part_index := range message.Parts {
+			part_subject_key := strings.TrimSpace(message.Parts[part_index].SubjectKey)
+			if part_subject_key != "" {
+				part_subject_keys = append(part_subject_keys, part_subject_key)
+			}
+		}
+	}
+
+	message_assets, err := s.load_content_asset_links(
+		content_conversation.Id,
+		model.ContentAssetSubjectConversationMessage,
+		message_keys,
+	)
+	if err != nil {
+		return err
+	}
+	part_assets, err := s.load_content_asset_links(
+		content_conversation.Id,
+		model.ContentAssetSubjectConversationMessagePart,
+		part_subject_keys,
+	)
+	if err != nil {
+		return err
+	}
+
+	for message_index := range content_conversation.Messages {
+		message := &content_conversation.Messages[message_index]
+		message.Assets = message_assets[message.MessageKey]
+		if message.Assets == nil {
+			message.Assets = make([]model.ContentAssetLink, 0)
+		}
+		for part_index := range message.Parts {
+			part := &message.Parts[part_index]
+			part.Assets = part_assets[part.SubjectKey]
+			if part.Assets == nil {
+				part.Assets = make([]model.ContentAssetLink, 0)
+			}
+		}
+	}
+	return nil
+}
+
+// GetContentConversationBranch returns one ordered root-to-leaf path from an
+// archived conversation tree. An empty branch_key selects CurrentBranchKey,
+// then the branch marked current, then the first stored branch.
+func (s *ContentService) GetContentConversationBranch(
+	content_id string,
+	branch_key string,
+) ([]model.ContentConversationMessage, error) {
+	if s.db == nil {
+		return nil, ErrDBNotInitialized
+	}
+	content_id = strings.TrimSpace(content_id)
+	branch_key = strings.TrimSpace(branch_key)
+	if content_id == "" {
+		return nil, fmt.Errorf("content id is required")
+	}
+
+	_, detail_value, err := s.load_content_extension(model.Content{
+		Id:   content_id,
+		Type: model.ContentTypeConversation,
+	})
+	if err != nil {
+		return nil, err
+	}
+	content_conversation, ok := detail_value.(*model.ContentConversation)
+	if !ok || content_conversation == nil {
+		return nil, fmt.Errorf("content conversation not found: %s", content_id)
+	}
+	if len(content_conversation.Branches) == 0 {
+		return content_conversation.Messages, nil
+	}
+
+	var selected_branch *model.ContentConversationBranch
+	if branch_key != "" {
+		for branch_index := range content_conversation.Branches {
+			branch := &content_conversation.Branches[branch_index]
+			if branch.BranchKey == branch_key {
+				selected_branch = branch
+				break
+			}
+		}
+	} else {
+		current_branch_key := strings.TrimSpace(content_conversation.CurrentBranchKey)
+		if current_branch_key != "" {
+			for branch_index := range content_conversation.Branches {
+				branch := &content_conversation.Branches[branch_index]
+				if branch.BranchKey == current_branch_key {
+					selected_branch = branch
+					break
+				}
+			}
+		}
+		if selected_branch == nil {
+			for branch_index := range content_conversation.Branches {
+				branch := &content_conversation.Branches[branch_index]
+				if branch.IsCurrent == 1 {
+					selected_branch = branch
+					break
+				}
+			}
+		}
+		if selected_branch == nil {
+			selected_branch = &content_conversation.Branches[0]
+		}
+	}
+	if selected_branch == nil {
+		return nil, fmt.Errorf("conversation branch not found: %s", branch_key)
+	}
+
+	messages_by_key := make(map[string]model.ContentConversationMessage, len(content_conversation.Messages))
+	for message_index := range content_conversation.Messages {
+		message := content_conversation.Messages[message_index]
+		messages_by_key[message.MessageKey] = message
+	}
+	message_key := strings.TrimSpace(selected_branch.LeafMessageKey)
+	if message_key == "" {
+		return nil, fmt.Errorf("conversation branch %s has no leaf message", selected_branch.BranchKey)
+	}
+	reversed_messages := make([]model.ContentConversationMessage, 0)
+	visited_message_keys := make(map[string]struct{})
+	root_message_key := strings.TrimSpace(selected_branch.RootMessageKey)
+	reached_root := false
+	for message_key != "" {
+		if _, visited := visited_message_keys[message_key]; visited {
+			return nil, fmt.Errorf("conversation branch contains a message cycle at %s", message_key)
+		}
+		visited_message_keys[message_key] = struct{}{}
+		message, exists := messages_by_key[message_key]
+		if !exists {
+			return nil, fmt.Errorf("conversation message not found in branch: %s", message_key)
+		}
+		reversed_messages = append(reversed_messages, message)
+		if root_message_key != "" && message_key == root_message_key {
+			reached_root = true
+			break
+		}
+		message_key = strings.TrimSpace(message.ParentMessageKey)
+	}
+	if root_message_key != "" && !reached_root {
+		return nil, fmt.Errorf(
+			"conversation branch %s cannot reach root message %s",
+			selected_branch.BranchKey,
+			root_message_key,
+		)
+	}
+
+	ordered_messages := make([]model.ContentConversationMessage, len(reversed_messages))
+	for message_index := range reversed_messages {
+		ordered_messages[len(reversed_messages)-1-message_index] = reversed_messages[message_index]
+	}
+	return ordered_messages, nil
+}
+
+func (s *ContentService) load_content_novel_chapter_assets(content_novel *model.ContentNovel) error {
+	if content_novel == nil || len(content_novel.Chapters) == 0 {
+		return nil
+	}
+	chapter_keys := make([]string, 0, len(content_novel.Chapters))
+	for chapter_index := range content_novel.Chapters {
+		chapter_key := strings.TrimSpace(content_novel.Chapters[chapter_index].ChapterKey)
+		if chapter_key != "" {
+			chapter_keys = append(chapter_keys, chapter_key)
+		}
+	}
+	if len(chapter_keys) == 0 {
+		return nil
+	}
+
+	asset_links_by_chapter_key, err := s.load_content_asset_links(
+		content_novel.Id,
+		model.ContentAssetSubjectNovelChapter,
+		chapter_keys,
+	)
+	if err != nil {
+		return err
+	}
+	for chapter_index := range content_novel.Chapters {
+		chapter := &content_novel.Chapters[chapter_index]
+		chapter.Assets = asset_links_by_chapter_key[chapter.ChapterKey]
+		if chapter.Assets == nil {
+			chapter.Assets = make([]model.ContentAssetLink, 0)
+		}
+	}
+	return nil
+}
+
+func (s *ContentService) load_content_album_image_assets(content_album *model.ContentAlbum) error {
+	if content_album == nil || len(content_album.Images) == 0 {
+		return nil
+	}
+	image_keys := make([]string, 0, len(content_album.Images))
+	for image_index := range content_album.Images {
+		image_key := strings.TrimSpace(content_album.Images[image_index].ImageKey)
+		if image_key != "" {
+			image_keys = append(image_keys, image_key)
+		}
+	}
+	if len(image_keys) == 0 {
+		return nil
+	}
+	asset_links_by_image_key, err := s.load_content_asset_links(
+		content_album.Id,
+		model.ContentAssetSubjectAlbumImage,
+		image_keys,
+	)
+	if err != nil {
+		return err
+	}
+	for image_index := range content_album.Images {
+		content_image := &content_album.Images[image_index]
+		content_image.Assets = asset_links_by_image_key[content_image.ImageKey]
+		if content_image.Assets == nil {
+			content_image.Assets = make([]model.ContentAssetLink, 0)
+		}
+	}
+	return nil
+}
+
+func (s *ContentService) load_content_asset_links(
+	content_id string,
+	subject_type string,
+	subject_keys []string,
+) (map[string][]model.ContentAssetLink, error) {
+	asset_links_by_subject_key := make(map[string][]model.ContentAssetLink, len(subject_keys))
+	if len(subject_keys) == 0 {
+		return asset_links_by_subject_key, nil
+	}
+	var asset_links []model.ContentAssetLink
+	if err := s.db.
+		Preload("Asset", "deleted_at IS NULL").
+		Preload("Asset.DownloadResources", func(db *gorm.DB) *gorm.DB {
+			return db.Where("deleted_at IS NULL").Order("created_at DESC, id DESC")
+		}).
+		Where(
+			"content_id = ? AND subject_type = ? AND subject_key IN ?",
+			content_id,
+			subject_type,
+			subject_keys,
+		).
+		Order("created_at ASC, asset_id ASC").
+		Find(&asset_links).Error; err != nil {
+		return nil, err
+	}
+	for link_index := range asset_links {
+		link := asset_links[link_index]
+		asset_links_by_subject_key[link.SubjectKey] = append(asset_links_by_subject_key[link.SubjectKey], link)
+	}
+	return asset_links_by_subject_key, nil
+}
+
+// ListContentRelations returns independently addressable content connected to
+// one content row. Both directions are supported so callers can resolve an
+// answer's question and a question's answers with the same API.
+func (s *ContentService) ListContentRelations(options ContentRelationListOptions) (*ContentRelationListResult, error) {
+	if s.db == nil {
+		return nil, ErrDBNotInitialized
+	}
+	content_id := strings.TrimSpace(options.ContentID)
+	if content_id == "" {
+		return nil, fmt.Errorf("content id is required")
+	}
+	direction := strings.ToLower(strings.TrimSpace(options.Direction))
+	if direction == "" {
+		direction = ContentRelationDirectionBoth
+	}
+	if direction != ContentRelationDirectionBoth &&
+		direction != ContentRelationDirectionIncoming &&
+		direction != ContentRelationDirectionOutgoing {
+		return nil, fmt.Errorf("unsupported content relation direction: %s", direction)
+	}
+
+	page := options.Page
+	if page < 1 {
+		page = 1
+	}
+	page_size := options.PageSize
+	if page_size < 1 {
+		page_size = 20
+	}
+	if page_size > 200 {
+		page_size = 200
+	}
+	offset := (page - 1) * page_size
+	if options.Offset != nil && *options.Offset >= 0 {
+		offset = *options.Offset
+	}
+
+	build_query := func() *gorm.DB {
+		query := s.db.Table("content_relation AS relation")
+		switch direction {
+		case ContentRelationDirectionIncoming:
+			query = query.
+				Joins("JOIN content AS related_content ON related_content.id = relation.source_content_id").
+				Where("relation.target_content_id = ?", content_id)
+		case ContentRelationDirectionOutgoing:
+			query = query.
+				Joins("JOIN content AS related_content ON related_content.id = relation.target_content_id").
+				Where("relation.source_content_id = ?", content_id)
+		default:
+			query = query.
+				Joins(`JOIN content AS related_content ON
+					(relation.source_content_id = ? AND related_content.id = relation.target_content_id)
+					OR (relation.target_content_id = ? AND related_content.id = relation.source_content_id)`, content_id, content_id).
+				Where("relation.source_content_id = ? OR relation.target_content_id = ?", content_id, content_id)
+		}
+		query = query.Where("related_content.deleted_at IS NULL")
+		if relation_type := strings.TrimSpace(options.Type); relation_type != "" {
+			query = query.Where("relation.type = ?", relation_type)
+		}
+		return query
+	}
+
+	var total int64
+	if err := build_query().Count(&total).Error; err != nil {
+		return nil, err
+	}
+
+	type content_relation_row struct {
+		SourceContentID    string `gorm:"column:source_content_id"`
+		TargetContentID    string `gorm:"column:target_content_id"`
+		RelationType       string `gorm:"column:relation_type"`
+		SortOrder          int    `gorm:"column:sort_order"`
+		Metadata           string `gorm:"column:metadata"`
+		CreatedAt          int64  `gorm:"column:created_at"`
+		ContentID          string `gorm:"column:content_id"`
+		ContentPlatformID  string `gorm:"column:content_platform_id"`
+		ContentType        string `gorm:"column:content_type"`
+		ContentSubtype     string `gorm:"column:content_subtype"`
+		ContentExternalID  string `gorm:"column:content_external_id"`
+		ContentExternalID2 string `gorm:"column:content_external_id2"`
+		ContentExternalID3 string `gorm:"column:content_external_id3"`
+		ContentTitle       string `gorm:"column:content_title"`
+		ContentDescription string `gorm:"column:content_description"`
+		ContentURL         string `gorm:"column:content_url"`
+		ContentSourceURL   string `gorm:"column:content_source_url"`
+		ContentCoverURL    string `gorm:"column:content_cover_url"`
+		ContentPublishTime *int64 `gorm:"column:content_publish_time"`
+		ContentUpdateTime  *int64 `gorm:"column:content_update_time"`
+	}
+	var rows []content_relation_row
+	if err := build_query().
+		Select(`relation.source_content_id, relation.target_content_id,
+			relation.type AS relation_type, relation.sort_order, relation.metadata,
+			relation.created_at, related_content.id AS content_id,
+			related_content.platform_id AS content_platform_id,
+			related_content.type AS content_type, related_content.subtype AS content_subtype,
+			related_content.external_id AS content_external_id,
+			related_content.external_id2 AS content_external_id2,
+			related_content.external_id3 AS content_external_id3,
+			related_content.title AS content_title,
+			related_content.description AS content_description,
+			related_content.url AS content_url,
+			related_content.source_url AS content_source_url,
+			related_content.cover_url AS content_cover_url,
+			related_content.publish_time AS content_publish_time,
+			related_content.update_time AS content_update_time`).
+		Order("relation.sort_order ASC, COALESCE(related_content.publish_time, 0) DESC, relation.created_at DESC, related_content.id ASC").
+		Limit(page_size).
+		Offset(offset).
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	list := make([]ContentRelationRecord, 0, len(rows))
+	for row_index := range rows {
+		row := rows[row_index]
+		relation_direction := ContentRelationDirectionIncoming
+		if row.SourceContentID == content_id {
+			relation_direction = ContentRelationDirectionOutgoing
+		}
+		publish_time := int64(0)
+		if row.ContentPublishTime != nil {
+			publish_time = *row.ContentPublishTime
+		}
+		update_time := int64(0)
+		if row.ContentUpdateTime != nil {
+			update_time = *row.ContentUpdateTime
+		}
+		list = append(list, ContentRelationRecord{
+			SourceContentID: row.SourceContentID,
+			TargetContentID: row.TargetContentID,
+			RelationType:    row.RelationType,
+			Direction:       relation_direction,
+			SortOrder:       row.SortOrder,
+			Metadata:        row.Metadata,
+			CreatedAt:       row.CreatedAt,
+			Content: ContentRelationContentRecord{
+				ID:          row.ContentID,
+				PlatformID:  row.ContentPlatformID,
+				Type:        row.ContentType,
+				Subtype:     row.ContentSubtype,
+				ExternalID:  row.ContentExternalID,
+				ExternalID2: row.ContentExternalID2,
+				ExternalID3: row.ContentExternalID3,
+				Title:       row.ContentTitle,
+				Description: row.ContentDescription,
+				URL:         row.ContentURL,
+				SourceURL:   row.ContentSourceURL,
+				CoverURL:    row.ContentCoverURL,
+				PublishTime: publish_time,
+				UpdateTime:  update_time,
+			},
+		})
+	}
+	return &ContentRelationListResult{
+		List:     list,
+		Total:    total,
+		Page:     page,
+		PageSize: page_size,
+	}, nil
+}
+
+func (s *ContentService) load_content_record(content_id string) (model.Content, error) {
+	var content model.Content
+	err := s.db.
+		Preload("Assets", func(db *gorm.DB) *gorm.DB {
+			return db.Where("deleted_at IS NULL").Order("sort_order ASC, id ASC")
+		}).
+		Preload("Assets.DownloadResources", func(db *gorm.DB) *gorm.DB {
+			return db.Where("deleted_at IS NULL").Order("created_at DESC, id DESC")
+		}).
+		Preload("TextTracks", func(db *gorm.DB) *gorm.DB {
+			return db.Where("deleted_at IS NULL").Order("is_default DESC, language_code ASC, id ASC")
+		}).
+		Preload("TextTracks.Sources", func(db *gorm.DB) *gorm.DB {
+			return db.Where("deleted_at IS NULL").Order("format ASC, asset_id ASC")
+		}).
+		Preload("TextTracks.Sources.Asset", "deleted_at IS NULL").
+		Preload("TextTracks.Sources.Asset.DownloadResources", func(db *gorm.DB) *gorm.DB {
+			return db.Where("deleted_at IS NULL").Order("created_at DESC, id DESC")
+		}).
+		Where("id = ?", content_id).
+		First(&content).Error
+	return content, err
+}
+
+func (s *ContentService) load_embedded_content_details(content model.Content) ([]ContentEmbeddedDetailItem, error) {
+	embedded_contents := make([]ContentEmbeddedDetailItem, 0)
+	if !content_supports_embedded_media(content.Type) {
+		return embedded_contents, nil
+	}
+
+	type embedded_content_row struct {
+		ContentID    string `gorm:"column:content_id"`
+		RelationType string `gorm:"column:relation_type"`
+		SortOrder    int    `gorm:"column:sort_order"`
+	}
+	var rows []embedded_content_row
+	if err := s.db.Table("content_relation AS relation").
+		Select(`related_content.id AS content_id, relation.type AS relation_type,
+			relation.sort_order`).
+		Joins("JOIN content AS related_content ON related_content.id = relation.target_content_id").
+		Where(`relation.source_content_id = ? AND relation.type = ?
+			AND related_content.type IN ? AND related_content.deleted_at IS NULL`,
+			content.Id, model.ContentRelationContains, embedded_content_media_types).
+		Order("relation.sort_order ASC, relation.created_at ASC, related_content.id ASC").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	for _, row := range rows {
+		embedded_content, err := s.load_content_record(row.ContentID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		detail_type, detail, err := s.load_content_extension(embedded_content)
+		if err != nil {
+			return nil, err
+		}
+		embedded_contents = append(embedded_contents, ContentEmbeddedDetailItem{
+			RelationType: row.RelationType,
+			SortOrder:    row.SortOrder,
+			Content:      embedded_content,
+			DetailType:   detail_type,
+			Detail:       detail,
+		})
+	}
+	return embedded_contents, nil
+}
+
+func (s *ContentService) GetContentDetail(content_id string) (*ContentDetailItem, error) {
+	if s.db == nil {
+		return nil, ErrDBNotInitialized
+	}
+
+	content_id = strings.TrimSpace(content_id)
+	if content_id == "" {
+		return nil, fmt.Errorf("content id is required")
+	}
+
+	content, err := s.load_content_record(content_id)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("content not found: %s", content_id)
+		}
+		return nil, err
+	}
+
+	embedded_contents, err := s.load_embedded_content_details(content)
+	if err != nil {
+		return nil, err
+	}
+	effective_content_ids := make([]string, 0, len(embedded_contents)+1)
+	effective_content_ids = append(effective_content_ids, content.Id)
+	for _, embedded_content := range embedded_contents {
+		effective_content_ids = append(effective_content_ids, embedded_content.Content.Id)
+	}
+
+	accounts_by_content_id, influencers_by_content_id, download_tasks_by_content_id, resources_by_content_id, err := s.load_content_relations(effective_content_ids, true)
+	if err != nil {
+		return nil, err
+	}
+
+	publish_time := int64(0)
+	if content.PublishTime != nil {
+		publish_time = *content.PublishTime
+	}
+	accounts := accounts_by_content_id[content.Id]
+	if accounts == nil {
+		accounts = make([]ContentAccountRecord, 0)
+	}
+	influencers := influencers_by_content_id[content.Id]
+	if influencers == nil {
+		influencers = make([]ContentInfluencerRecord, 0)
+	}
+	download_tasks := make([]ContentDownloadTaskRecord, 0)
+	resources := make([]ContentResourceRecord, 0)
+	seen_task_ids := make(map[int]bool)
+	for _, effective_content_id := range effective_content_ids {
+		for _, task := range download_tasks_by_content_id[effective_content_id] {
+			if seen_task_ids[task.ID] {
+				continue
+			}
+			seen_task_ids[task.ID] = true
+			download_tasks = append(download_tasks, task)
+		}
+		resources = append(resources, resources_by_content_id[effective_content_id]...)
+	}
+	sort_content_resources(resources, content.Type)
+	detail_type, detail, err := s.load_content_extension(content)
+	if err != nil {
+		return nil, err
+	}
+	relations, err := s.ListContentRelations(ContentRelationListOptions{
+		ContentID: content.Id,
+		Direction: ContentRelationDirectionBoth,
+		Page:      1,
+		PageSize:  100,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &ContentDetailItem{
+		ContentListItem: ContentListItem{
+			ID:            content.Id,
+			PlatformID:    content.PlatformId,
+			Type:          content.Type,
+			Subtype:       content.Subtype,
+			ExternalID:    content.ExternalId,
+			ExternalID2:   content.ExternalId2,
+			ExternalID3:   content.ExternalId3,
+			Title:         content.Title,
+			Description:   content.Description,
+			URL:           content.URL,
+			SourceURL:     content.SourceURL,
+			CoverURL:      content.CoverURL,
+			CoverWidth:    content.CoverWidth,
+			CoverHeight:   content.CoverHeight,
+			PublishTime:   publish_time,
+			CreatedAt:     content.CreatedAt,
+			Accounts:      accounts,
+			Influencers:   influencers,
+			DownloadTasks: download_tasks,
+			FileCount:     int64(len(resources)),
+		},
+		Content:          content,
+		Resources:        resources,
+		DetailType:       detail_type,
+		Detail:           detail,
+		EmbeddedContents: embedded_contents,
+		Relations:        *relations,
+	}, nil
+}
+
+func (s *ContentService) ListContents(options ContentListOptions) (*ContentListResult, error) {
+	if s.db == nil {
+		return nil, ErrDBNotInitialized
+	}
+	scope := strings.ToLower(strings.TrimSpace(options.Scope))
+	if scope == "" {
+		scope = ContentListScopeAll
+	}
+	if scope != ContentListScopeAll && scope != ContentListScopeTask {
+		return nil, fmt.Errorf("unsupported content list scope %q", options.Scope)
+	}
+	if options.StartAt != nil && *options.StartAt < 0 {
+		return nil, fmt.Errorf("start_at must be a non-negative Unix timestamp in milliseconds")
+	}
+	if options.EndAt != nil && *options.EndAt < 0 {
+		return nil, fmt.Errorf("end_at must be a non-negative Unix timestamp in milliseconds")
+	}
+	if options.StartAt != nil && options.EndAt != nil && *options.StartAt >= *options.EndAt {
+		return nil, fmt.Errorf("start_at must be less than end_at")
+	}
+
+	page := options.Page
+	if page < 1 {
+		page = 1
+	}
+	page_size := options.PageSize
+	if page_size < 1 {
+		page_size = 20
+	}
+	offset := (page - 1) * page_size
+	if options.Offset != nil && *options.Offset >= 0 {
+		offset = *options.Offset
+	}
+
+	build_query := func() *gorm.DB {
+		query := exclude_embedded_contents(s.db.Model(&model.Content{}).Where("content.deleted_at IS NULL"))
+		if scope == ContentListScopeTask {
+			query = query.Where(`EXISTS (
+				SELECT 1
+				FROM download_task
+				WHERE download_task.content_id = content.id
+					AND download_task.deleted_at IS NULL
+			)`)
+		}
+		if content_type := strings.TrimSpace(options.Type); content_type != "" {
+			query = query.Where("content.type = ?", content_type)
+		}
+		if platform_id := strings.TrimSpace(options.PlatformID); platform_id != "" {
+			query = query.Where("content.platform_id = ?", platform_id)
+		}
+		if account_id := strings.TrimSpace(options.AccountID); account_id != "" {
+			query = query.
+				Joins("JOIN content_account ON content_account.content_id = content.id").
+				Where("content_account.account_id = ?", account_id)
+		}
+		if keyword := strings.TrimSpace(options.Keyword); keyword != "" {
+			pattern := "%" + keyword + "%"
+			query = query.Where("content.title LIKE ? OR content.description LIKE ?", pattern, pattern)
+		}
+		if options.StartAt != nil {
+			query = query.Where("content.created_at >= ?", *options.StartAt)
+		}
+		if options.EndAt != nil {
+			query = query.Where("content.created_at < ?", *options.EndAt)
+		}
+		return query
+	}
+
+	var total int64
+	if err := build_query().Count(&total).Error; err != nil {
+		return nil, err
+	}
+
+	var contents []model.Content
+	if err := build_query().
+		Select(`content.id, content.platform_id, content.type, content.subtype,
+			content.external_id, content.external_id2, content.external_id3,
+			content.title, content.description, content.url, content.source_url,
+			content.cover_url, content.cover_width, content.cover_height,
+			content.publish_time, content.created_at`).
+		Order("content.created_at DESC, content.id DESC").
+		Limit(page_size).
+		Offset(offset).
+		Find(&contents).Error; err != nil {
+		return nil, err
+	}
+
+	content_ids := make([]string, 0, len(contents))
+	for _, content := range contents {
+		content_ids = append(content_ids, content.Id)
+	}
+
+	accounts_by_content_id, influencers_by_content_id, download_tasks_by_content_id, _, err := s.load_content_relations(content_ids, false)
+	if err != nil {
+		return nil, err
+	}
+	file_counts_by_content_id := make(map[string]int64, len(content_ids))
+	if len(content_ids) > 0 {
+		type content_file_count_row struct {
+			ContentID string `gorm:"column:content_id"`
+			Count     int64  `gorm:"column:count"`
+		}
+		var file_count_rows []content_file_count_row
+		if err := s.db.Model(&model.DownloadResource{}).
+			Select("content_id, COUNT(*) AS count").
+			Where("content_id IN ? AND deleted_at IS NULL", content_ids).
+			Group("content_id").
+			Scan(&file_count_rows).Error; err != nil {
+			return nil, err
+		}
+		for _, file_count_row := range file_count_rows {
+			file_counts_by_content_id[file_count_row.ContentID] = file_count_row.Count
+		}
+
+		type embedded_file_count_row struct {
+			ContentID string `gorm:"column:content_id"`
+			Count     int64  `gorm:"column:count"`
+		}
+		var embedded_file_count_rows []embedded_file_count_row
+		if err := s.db.Table("content_relation AS relation").
+			Select("relation.source_content_id AS content_id, COUNT(download_resource.id) AS count").
+			Joins("JOIN content AS parent_content ON parent_content.id = relation.source_content_id").
+			Joins("JOIN content AS embedded_content ON embedded_content.id = relation.target_content_id").
+			Joins(`JOIN download_resource ON download_resource.content_id = embedded_content.id
+				AND download_resource.deleted_at IS NULL`).
+			Where(`relation.source_content_id IN ? AND relation.type = ?
+				AND parent_content.type IN ? AND parent_content.deleted_at IS NULL
+				AND embedded_content.type IN ? AND embedded_content.deleted_at IS NULL`,
+				content_ids,
+				model.ContentRelationContains,
+				embedded_content_parent_types,
+				embedded_content_media_types,
+			).
+			Group("relation.source_content_id").
+			Scan(&embedded_file_count_rows).Error; err != nil {
+			return nil, err
+		}
+		for _, file_count_row := range embedded_file_count_rows {
+			file_counts_by_content_id[file_count_row.ContentID] += file_count_row.Count
+		}
+	}
+
+	list := make([]ContentListItem, 0, len(contents))
+	for _, content := range contents {
+		publish_time := int64(0)
+		if content.PublishTime != nil {
+			publish_time = *content.PublishTime
+		}
+		accounts := accounts_by_content_id[content.Id]
+		if accounts == nil {
+			accounts = make([]ContentAccountRecord, 0)
+		}
+		influencers := influencers_by_content_id[content.Id]
+		if influencers == nil {
+			influencers = make([]ContentInfluencerRecord, 0)
+		}
+		download_tasks := download_tasks_by_content_id[content.Id]
+		if download_tasks == nil {
+			download_tasks = make([]ContentDownloadTaskRecord, 0)
+		}
+		list = append(list, ContentListItem{
+			ID:            content.Id,
+			PlatformID:    content.PlatformId,
+			Type:          content.Type,
+			Subtype:       content.Subtype,
+			ExternalID:    content.ExternalId,
+			ExternalID2:   content.ExternalId2,
+			ExternalID3:   content.ExternalId3,
+			Title:         content.Title,
+			Description:   content.Description,
+			URL:           content.URL,
+			SourceURL:     content.SourceURL,
+			CoverURL:      content.CoverURL,
+			CoverWidth:    content.CoverWidth,
+			CoverHeight:   content.CoverHeight,
+			PublishTime:   publish_time,
+			CreatedAt:     content.CreatedAt,
+			Accounts:      accounts,
+			Influencers:   influencers,
+			DownloadTasks: download_tasks,
+			FileCount:     file_counts_by_content_id[content.Id],
+		})
+	}
+
+	return &ContentListResult{
+		List:     list,
+		Total:    total,
+		Page:     page,
+		PageSize: page_size,
+	}, nil
+}
+
+func (s *ContentService) ListBrowseHistory(page, page_size int) (*PageResult, error) {
+	if s.db == nil {
+		return nil, ErrDBNotInitialized
+	}
+	var total int64
+	if err := s.db.Model(&model.BrowseHistory{}).Count(&total).Error; err != nil {
+		return nil, err
+	}
+	var list []model.BrowseHistory
+	if err := s.db.Order("id DESC").Limit(page_size).Offset((page - 1) * page_size).Find(&list).Error; err != nil {
+		return nil, err
+	}
+	return &PageResult{
+		List:     list,
+		Total:    total,
+		Page:     page,
+		PageSize: page_size,
+	}, nil
+}
+
+var ErrInvalidInput = &ServiceError{"invalid input"}

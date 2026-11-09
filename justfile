@@ -1,6 +1,7 @@
 set windows-shell := ["powershell.exe", "-NoProfile", "-Command"]
 
 export GOPROXY := "https://goproxy.cn,direct"
+export GOFLAGS := "-tags=embed_inject,embed_frontend_inject,sqlite_only"
 
 default: build
 

@@ -1,0 +1,268 @@
+package hermes
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const default_http_probe_size = 512
+
+// defaultHTTPDriver is the dependency-free HTTP/HTTPS driver used by the
+// high-level API. Applications may replace it with RegisterProtocol.
+type default_http_driver struct {
+	mu      sync.Mutex
+	clients map[string]*http.Client
+}
+
+func new_default_http_driver() *default_http_driver {
+	return &default_http_driver{clients: make(map[string]*http.Client)}
+}
+
+func (d *default_http_driver) Protocols() []string {
+	return []string{"http", "https"}
+}
+
+func (d *default_http_driver) Prepare(ctx context.Context, endpoint Endpoint) (PreparedResource, error) {
+	req, err := d.new_request(ctx, endpoint, ReadRequest{
+		OffsetStart: 0,
+		OffsetEnd:   default_http_probe_size - 1,
+		UseRange:    true,
+	})
+	if err != nil {
+		return PreparedResource{}, err
+	}
+	resp, err := d.do(req, endpoint.ProxyServer)
+	if err != nil {
+		return PreparedResource{}, err
+	}
+	defer resp.Body.Close()
+
+	probe, err := io.ReadAll(io.LimitReader(resp.Body, default_http_probe_size))
+	if err != nil {
+		return PreparedResource{}, fmt.Errorf("read HTTP probe: %w", err)
+	}
+	prepared := PreparedResource{
+		ContentType: resp.Header.Get("Content-Type"),
+		ProbeData:   probe,
+	}
+
+	if resp.StatusCode == http.StatusPartialContent {
+		start, _, total, ok := parse_default_http_content_range(resp.Header.Get("Content-Range"))
+		if !ok || start != 0 {
+			return PreparedResource{}, errors.New("server returned an invalid Content-Range")
+		}
+		prepared.Size = total
+		prepared.SupportsRange = true
+		return prepared, nil
+	}
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		var total int64
+		if _, scan_err := fmt.Sscanf(strings.TrimSpace(resp.Header.Get("Content-Range")), "bytes */%d", &total); scan_err == nil && total == 0 {
+			return prepared, nil
+		}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return PreparedResource{}, default_http_probe_status_error(resp, len(probe))
+	}
+	if value := resp.Header.Get("Content-Length"); value != "" {
+		if size, parse_err := strconv.ParseInt(value, 10, 64); parse_err == nil && size >= 0 {
+			prepared.Size = size
+		}
+	}
+	return prepared, nil
+}
+
+func default_http_probe_status_error(resp *http.Response, body_bytes int) error {
+	if resp == nil {
+		return errors.New("resource probe returned no HTTP response")
+	}
+	detail := fmt.Sprintf(
+		"response content-type=%q content-length=%q content-range=%q server=%q body-bytes=%d",
+		resp.Header.Get("Content-Type"),
+		resp.Header.Get("Content-Length"),
+		resp.Header.Get("Content-Range"),
+		resp.Header.Get("Server"),
+		body_bytes,
+	)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("resource probe rejected with HTTP status %d: endpoint authorization, signed URL, access token, or request challenge may be missing, invalid, or expired (%s)", resp.StatusCode, detail)
+	}
+	return fmt.Errorf("resource probe returned HTTP status %d (%s)", resp.StatusCode, detail)
+}
+
+func (d *default_http_driver) Open(ctx context.Context, endpoint Endpoint, request ReadRequest) (io.ReadCloser, error) {
+	req, err := d.new_request(ctx, endpoint, request)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.do(req, endpoint.ProxyServer)
+	if err != nil {
+		return nil, err
+	}
+
+	if request.UseRange {
+		// A 200 response is valid for a range that covers the complete object.
+		// Accept it only when the response length proves that no partial-range
+		// semantics are being lost.
+		if full_range_response_matches_request(resp, request) {
+			return resp.Body, nil
+		}
+		if resp.StatusCode != http.StatusPartialContent {
+			resp.Body.Close()
+			return nil, default_http_range_response_status_error(resp.StatusCode)
+		}
+		start, end, _, ok := parse_default_http_content_range(resp.Header.Get("Content-Range"))
+		if !ok || start != request.OffsetStart || end > request.OffsetEnd {
+			resp.Body.Close()
+			return nil, errors.New("server returned a Content-Range that does not match the request")
+		}
+		return resp.Body, nil
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		resp.Body.Close()
+		return nil, fmt.Errorf("server returned error status code: %d", resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
+func default_http_range_response_status_error(status_code int) error {
+	switch status_code {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Errorf("range request rejected with HTTP status %d: endpoint authorization, signed URL, or access token may be missing, invalid, or expired", status_code)
+	case http.StatusRequestedRangeNotSatisfiable:
+		return fmt.Errorf("range request rejected with HTTP status %d: requested byte range is not satisfiable", status_code)
+	case http.StatusOK:
+		return errors.New("server ignored the requested byte range and returned HTTP status 200")
+	default:
+		return fmt.Errorf("range request returned unexpected HTTP status %d", status_code)
+	}
+}
+
+func full_range_response_matches_request(resp *http.Response, request ReadRequest) bool {
+	if resp == nil || resp.StatusCode != http.StatusOK || request.OffsetStart != 0 || request.OffsetEnd < 0 {
+		return false
+	}
+	return resp.ContentLength == request.OffsetEnd+1
+}
+
+func (d *default_http_driver) new_request(ctx context.Context, endpoint Endpoint, request ReadRequest) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Accept", "*/*")
+	if request.UseRange {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", request.OffsetStart, request.OffsetEnd))
+	}
+	for key, value := range endpoint.Headers {
+		req.Header.Set(key, value)
+	}
+	if endpoint.Cookies != "" {
+		req.Header.Set("Cookie", endpoint.Cookies)
+	}
+	return req, nil
+}
+
+func (d *default_http_driver) do(req *http.Request, proxy_server ProxyServer) (*http.Response, error) {
+	proxy_url, err := proxy_server.URL()
+	if err != nil {
+		return nil, err
+	}
+	client, err := d.client(proxy_url)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err == nil || proxy_url != "" || !IsCertificateVerifyError(err) {
+		return resp, err
+	}
+	// Go dials IPv6 first (RFC 6724) and a failed TLS handshake never falls back
+	// to the next address, so a CDN edge that serves the wrong certificate over
+	// IPv6 fails the request even when the IPv4 address of the same host works.
+	ipv4_client, client_err := d.client_for_family(proxy_url, "tcp4")
+	if client_err != nil {
+		return nil, err
+	}
+	// The request was already sent, so replay a clone rather than the original.
+	resp, retry_err := ipv4_client.Do(req.Clone(req.Context()))
+	if retry_err != nil {
+		return nil, fmt.Errorf("%w (IPv4 retry failed: %v)", err, retry_err)
+	}
+	return resp, nil
+}
+
+func (d *default_http_driver) client(raw_proxy_url string) (*http.Client, error) {
+	return d.client_for_family(raw_proxy_url, "")
+}
+
+// client_for_family returns a cached client. family restricts dialing to one
+// address family ("tcp4" for IPv4-only, "" for both) and forms part of the
+// cache key.
+func (d *default_http_driver) client_for_family(raw_proxy_url, family string) (*http.Client, error) {
+	proxy_url, parsed_proxy_url, err := normalize_default_http_proxy_url(raw_proxy_url)
+	if err != nil {
+		return nil, err
+	}
+	cache_key := proxy_url
+	if family != "" {
+		cache_key += "|" + family
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if client := d.clients[cache_key]; client != nil {
+		return client, nil
+	}
+
+	transport := &http.Transport{
+		ForceAttemptHTTP2:   true,
+		DialContext:         HTTPDialContext(family),
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	if parsed_proxy_url != nil {
+		transport.Proxy = http.ProxyURL(parsed_proxy_url)
+	}
+	client := &http.Client{Transport: transport}
+	d.clients[cache_key] = client
+	return client, nil
+}
+
+func normalize_default_http_proxy_url(raw_proxy_url string) (string, *url.URL, error) {
+	raw_proxy_url = strings.TrimSpace(raw_proxy_url)
+	if raw_proxy_url == "" {
+		return "", nil, nil
+	}
+	proxy_url, err := url.Parse(raw_proxy_url)
+	if err != nil || proxy_url.Host == "" || proxy_url.Hostname() == "" {
+		return "", nil, errors.New("invalid proxy URL")
+	}
+	proxy_url.Scheme = strings.ToLower(proxy_url.Scheme)
+	switch proxy_url.Scheme {
+	case "http", "https", "socks5":
+	default:
+		return "", nil, fmt.Errorf("unsupported proxy scheme %q", proxy_url.Scheme)
+	}
+	return proxy_url.String(), proxy_url, nil
+}
+
+func parse_default_http_content_range(value string) (start, end, total int64, ok bool) {
+	if _, err := fmt.Sscanf(strings.TrimSpace(value), "bytes %d-%d/%d", &start, &end, &total); err != nil {
+		return 0, 0, 0, false
+	}
+	if start < 0 || end < start || total <= end {
+		return 0, 0, 0, false
+	}
+	return start, end, total, true
+}
