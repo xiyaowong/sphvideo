@@ -1,0 +1,19 @@
+{
+  "name": "sphvideo",
+  "slug": "sphvideo",
+  "identifier": "io.github.xiyaowong.sphvideo",
+  "version": "0.1.0",
+  "copyright": "© 2026 sphvideo contributors",
+  "publisher": "sphvideo contributors",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "out": "build",
+  "i18n": {
+    "dir": "locales",
+    "source": "zh-Hans"
+  },
+  "windows": {
+    "displayName": "视频号视频下载",
+    "installDirName": "SphVideo"
+  }
+}

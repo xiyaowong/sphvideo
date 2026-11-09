@@ -1,0 +1,47 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: Build Windows binary and installer
+        run: |
+          mkdir -p dist
+          go tool mygo build -platform windows/amd64
+          cp build/windows-amd64/sphvideo.exe dist/sphvideo.exe
+          setup=$(find build/windows-amd64 -maxdepth 1 -name '*setup*.exe' | head -n1)
+          test -n "$setup"
+          cp "$setup" "dist/视频号视频下载-安装包.exe"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sphvideo-windows-binary
+          path: dist/sphvideo.exe
+          if-no-files-found: error
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: sphvideo-windows-installer
+          path: dist/视频号视频下载-安装包.exe
+          if-no-files-found: error
