@@ -20,16 +20,15 @@ type State struct {
 	svc *proxy.Service
 	win *mygo.Window
 
-	mu           sync.Mutex
-	status       string
-	saveDir      string
-	running      bool
-	starting     bool
-	stopping     bool
-	repairing    bool
-	hiddenNotice bool
-	lastResult   string
-	lastPulse    time.Time
+	mu         sync.Mutex
+	status     string
+	saveDir    string
+	running    bool
+	starting   bool
+	stopping   bool
+	repairing  bool
+	lastResult string
+	lastPulse  time.Time
 
 	advancedOpen bool
 }
@@ -69,34 +68,6 @@ func (s *State) ActiveDownloads() int {
 
 func (s *State) Toggle() {
 	s.toggle()
-}
-
-func (s *State) StopFromTray() {
-	s.mu.Lock()
-	running := s.running
-	s.mu.Unlock()
-	if running {
-		s.toggle()
-	}
-}
-
-func (s *State) RepairFromTray() {
-	s.repair()
-}
-
-func (s *State) NotifyHidden() {
-	s.mu.Lock()
-	first := !s.hiddenNotice
-	s.hiddenNotice = true
-	s.mu.Unlock()
-	if !first {
-		return
-	}
-	note := mygo.NewNotification(mygo.NotificationOptions{
-		Title: "仍在后台运行",
-		Body:  "下载服务保持开启。在托盘菜单里选择「显示窗口」可以重新打开。",
-	})
-	_ = note.Show()
 }
 
 func (s *State) setStatus(msg string) {
@@ -280,7 +251,7 @@ func (s *State) View(c *ui.Context) {
 			}
 
 			if running {
-				ui.Text(c, "可最小化；关闭窗口后在托盘继续运行。").
+				ui.Text(c, "关闭窗口会停止服务、恢复网络并退出。").
 					FontSize(11).TextColor(t.TextMuted).Wrap()
 			}
 
@@ -455,7 +426,7 @@ func friendlyStartError(err error) string {
 	case strings.Contains(msg, "端口"):
 		return "本地端口被占用，请重启电脑后再试。"
 	case strings.Contains(msg, "证书"):
-		return "无法安装临时证书。请允许系统的证书确认，或检查安全软件的拦截提示。"
+		return "无法安装临时证书。请确认程序以管理员身份运行，并检查安全软件的拦截提示。"
 	case strings.Contains(msg, "代理"):
 		return "无法修改系统代理。请检查安全软件是否拦截本程序。"
 	case strings.Contains(msg, "守护"):

@@ -1,7 +1,6 @@
 package main
 
 import (
-	_ "embed"
 	"log"
 	"os"
 	"sync/atomic"
@@ -14,15 +13,19 @@ import (
 	_ "sphvideo/locales"
 )
 
-//go:embed tray.png
-var trayIcon []byte
-
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "--watchdog" {
 		proxy.RunWatchdog(os.Args[2])
 		return
 	}
 	mygo.App.SetName("视频号视频下载")
+	// Elevate before taking the single instance lock: the relaunched process
+	// must not find the socket of the process it replaces. The temporary CA
+	// goes into the machine's root store, which needs administrator rights
+	// and installs and removes it without prompts.
+	if requireAdmin() {
+		return
+	}
 	if !mygo.App.RequestSingleInstanceLock() {
 		return
 	}
@@ -79,43 +82,18 @@ func main() {
 		winPtr.Store(w)
 		state.AttachWindow(w)
 
-		if setupTray(state, showWindow) != nil {
-			w.OnClose(func(e *mygo.CloseEvent) {
-				if quitting {
-					return
-				}
-				e.PreventDefault()
-				w.Hide()
-				state.NotifyHidden()
-			})
-		}
+		// Closing the window stops the service and quits. The confirmation
+		// runs in OnBeforeQuit, so a canceled quit keeps the window open.
+		w.OnClose(func(e *mygo.CloseEvent) {
+			if quitting {
+				return
+			}
+			e.PreventDefault()
+			mygo.App.Quit()
+		})
 	})
 
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func setupTray(state *app.State, show func()) *mygo.Tray {
-	if len(trayIcon) == 0 {
-		return nil
-	}
-	menu := mygo.NewMenu([]*mygo.MenuItem{
-		{Label: "显示窗口", Click: func(*mygo.MenuItem, *mygo.Window) { show() }},
-		{Label: "停止并恢复网络", Click: func(*mygo.MenuItem, *mygo.Window) { state.StopFromTray() }},
-		{Label: "修复网络", Click: func(*mygo.MenuItem, *mygo.Window) { state.RepairFromTray() }},
-		mygo.Separator(),
-		{Label: "退出", Click: func(*mygo.MenuItem, *mygo.Window) { mygo.App.Quit() }},
-	})
-	tray, err := mygo.NewTray(mygo.TrayOptions{
-		ID:      "main",
-		Icon:    trayIcon,
-		ToolTip: "视频号视频下载",
-		Menu:    menu,
-	})
-	if err != nil {
-		return nil
-	}
-	tray.OnClick(func() { show() })
-	return tray
 }

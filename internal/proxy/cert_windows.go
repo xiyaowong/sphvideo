@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"unsafe"
 
@@ -11,10 +12,11 @@ import (
 )
 
 const (
-	certStoreProvSystemW = 10
-	certSystemStoreUser  = 0x00010000
-	certStoreAddReplace  = 3
-	certEncoding         = 0x00000001 | 0x00010000
+	certStoreProvSystemW   = 10
+	certSystemStoreUser    = 0x00010000
+	certSystemStoreMachine = 0x00020000
+	certStoreAddReplace    = 3
+	certEncoding           = 0x00000001 | 0x00010000
 )
 
 var (
@@ -41,13 +43,13 @@ func certContextFromHandle(p uintptr) *certContext {
 	return (*certContext)(unsafe.Pointer(p))
 }
 
-func openRootStore() (windows.Handle, error) {
+func openRootStore(flags uint32) (windows.Handle, error) {
 	name, err := windows.UTF16PtrFromString("Root")
 	if err != nil {
 		return 0, err
 	}
 	h, _, callErr := procCertOpenStore.Call(
-		certStoreProvSystemW, 0, 0, certSystemStoreUser, uintptr(unsafe.Pointer(name)),
+		certStoreProvSystemW, 0, 0, uintptr(flags), uintptr(unsafe.Pointer(name)),
 	)
 	if h == 0 {
 		return 0, fmt.Errorf("CertOpenStore: %v", callErr)
@@ -55,8 +57,10 @@ func openRootStore() (windows.Handle, error) {
 	return windows.Handle(h), nil
 }
 
+// installCA writes to the machine's root store: that needs the elevated token
+// and adds the certificate without the confirmation the user store shows.
 func installCA(der []byte) error {
-	store, err := openRootStore()
+	store, err := openRootStore(certSystemStoreMachine)
 	if err != nil {
 		return err
 	}
@@ -78,9 +82,15 @@ func installCA(der []byte) error {
 }
 
 // removeCA deletes every certificate this program may have installed, including
-// leftovers from a crashed run.
+// leftovers from a crashed run and from older versions that used the user store.
 func removeCA() error {
-	store, err := openRootStore()
+	machine := removeFromStore(certSystemStoreMachine)
+	user := removeFromStore(certSystemStoreUser)
+	return errors.Join(machine, user)
+}
+
+func removeFromStore(flags uint32) error {
+	store, err := openRootStore(flags)
 	if err != nil {
 		return err
 	}
