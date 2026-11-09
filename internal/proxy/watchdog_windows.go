@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package proxy
 
 import (
 	"bufio"
@@ -28,7 +28,7 @@ type watchdogState struct {
 	Pac         string `json:"pv"`
 }
 
-func runWatchdog(encoded string) {
+func RunWatchdog(encoded string) {
 	raw, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
 		return

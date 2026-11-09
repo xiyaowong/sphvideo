@@ -22,6 +22,15 @@
 - 系统代理原值只保存在内存，退出时恢复；异常退出由 watchdog 恢复。
 - 不安装服务或驱动，不需要管理员权限。
 
+## 目录
+
+- `cmd/sphvideo`：入口
+- `internal/app`：界面与状态
+- `internal/proxy`：代理、证书、系统代理
+- `internal/download`：下载与解密
+- `internal/inject`：页面与 JS 注入
+- `locales`、`resources`：安装器语言与应用图标
+
 ## 构建
 
 ```powershell

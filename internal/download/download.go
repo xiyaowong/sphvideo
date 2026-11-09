@@ -1,7 +1,6 @@
-package main
+package download
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,7 +13,7 @@ import (
 	"unicode"
 )
 
-type downloadRequest struct {
+type Request struct {
 	URL    string `json:"url"`
 	Key    string `json:"key"`
 	Title  string `json:"title"`
@@ -22,52 +21,7 @@ type downloadRequest struct {
 	Spec   string `json:"spec"`
 }
 
-type downloadResponse struct {
-	OK    bool   `json:"ok"`
-	Path  string `json:"path,omitempty"`
-	Error string `json:"error,omitempty"`
-}
-
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func cors(w http.ResponseWriter) {
-	h := w.Header()
-	h.Set("Access-Control-Allow-Origin", "*")
-	h.Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	h.Set("Access-Control-Allow-Headers", "Content-Type")
-	h.Set("Access-Control-Allow-Private-Network", "true")
-	h.Set("Access-Control-Max-Age", "600")
-}
-
-func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
-	cors(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, downloadResponse{Error: "POST only"})
-		return
-	}
-	var req downloadRequest
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
-	if err := dec.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, downloadResponse{Error: "bad request"})
-		return
-	}
-	path, err := s.download(req)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, downloadResponse{Error: err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, downloadResponse{OK: true, Path: path})
-}
-
-func (s *Service) download(req downloadRequest) (string, error) {
+func Save(req Request, dir string, proxy func(*http.Request) (*url.URL, error), status func(string)) (string, error) {
 	raw := strings.TrimSpace(req.URL)
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
@@ -101,10 +55,6 @@ func (s *Service) download(req downloadRequest) (string, error) {
 		}
 	}
 
-	s.mu.Lock()
-	dir := s.saveDir
-	snap := s.proxySnapshot
-	s.mu.Unlock()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("创建目录失败: %w", err)
 	}
@@ -114,7 +64,9 @@ func (s *Service) download(req downloadRequest) (string, error) {
 	}
 	outPath := uniquePath(dir, name, ".mp4")
 
-	s.setStatus("正在下载：" + name)
+	if status != nil {
+		status("正在下载：" + name)
+	}
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return "", fmt.Errorf("创建文件失败: %w", err)
@@ -128,7 +80,7 @@ func (s *Service) download(req downloadRequest) (string, error) {
 	}()
 
 	client := &http.Client{
-		Transport: &http.Transport{Proxy: downloadProxy(snap)},
+		Transport: &http.Transport{Proxy: proxy},
 		Timeout:   0,
 	}
 	httpReq, err := http.NewRequest(http.MethodGet, raw, nil)
@@ -155,7 +107,9 @@ func (s *Service) download(req downloadRequest) (string, error) {
 		return "", fmt.Errorf("解密失败: %w", err)
 	}
 	ok = true
-	s.setStatus("已保存：" + outPath)
+	if status != nil {
+		status("已保存：" + outPath)
+	}
 	return outPath, nil
 }
 
@@ -182,8 +136,7 @@ func safeFilename(title string) string {
 		count++
 	}
 	name := strings.TrimSpace(b.String())
-	name = strings.Trim(name, ".")
-	return name
+	return strings.Trim(name, ".")
 }
 
 func uniquePath(dir, name, ext string) string {

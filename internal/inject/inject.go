@@ -1,4 +1,4 @@
-package main
+package inject
 
 import (
 	_ "embed"
@@ -29,7 +29,7 @@ func scriptFor(port int) string {
 	return strings.ReplaceAll(injectJS, "__SPH_PORT__", fmt.Sprint(port))
 }
 
-func injectHTML(html string, port int, version string) string {
+func HTML(html string, port int, version string) string {
 	html = reHTMLScript.ReplaceAllString(html, `$1="$2.js?v=`+version+`"`)
 	script := "<script>" + scriptFor(port) + "</script>"
 	if i := strings.Index(html, "</head>"); i >= 0 {
@@ -39,8 +39,15 @@ func injectHTML(html string, port int, version string) string {
 }
 
 // Hooks the feed calls and keeps the current feed on navigation.
-func patchChannelsJS(js, version string) string {
-	js = patchImports(js, version)
+func Imports(js, version string) string {
+	js = reJSFrom.ReplaceAllString(js, `from"$1.js?v=`+version+`"`)
+	js = reJSDependency.ReplaceAllString(js, `"js/$1.js?v=`+version+`"`)
+	js = reJSLazy.ReplaceAllString(js, `import("$1.js?v=`+version+`")`)
+	return reJSImport.ReplaceAllString(js, `import"$1.js?v=`+version+`"`)
+}
+
+func ChannelsJS(js, version string) string {
+	js = Imports(js, version)
 
 	js = reCommentDetail.ReplaceAllStringFunc(js, func(m string) string {
 		sub := reCommentDetail.FindStringSubmatch(m)

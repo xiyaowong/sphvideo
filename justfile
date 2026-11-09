@@ -6,10 +6,10 @@ default: build
 
 build:
     New-Item -ItemType Directory -Force dist | Out-Null
-    go build -trimpath -tags mygo_noinspector -ldflags "-s -w -X github.com/egoist/mygo.production=1" -o dist/sphvideo.exe .
+    go build -trimpath -tags mygo_noinspector -ldflags "-s -w -X github.com/egoist/mygo.production=1" -o dist/sphvideo.exe ./cmd/sphvideo
 
 dev:
-    go run .
+    go run ./cmd/sphvideo
 
 tidy:
     go mod tidy

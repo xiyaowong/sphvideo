@@ -1,7 +1,8 @@
-package main
+//go:build windows
+
+package app
 
 import (
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -10,61 +11,58 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
-	_ "sphvideo/locales"
+	"sphvideo/internal/proxy"
 )
 
-type appState struct {
-	svc *Service
+type State struct {
+	svc *proxy.Service
 
 	mu        sync.Mutex
 	status    string
 	saveDir   string
 	running   bool
-	lastPulse time.Time
 	starting  bool
+	lastPulse time.Time
 }
 
-func newAppState() *appState {
+func New() *State {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, "Downloads", "视频号")
-	s := &appState{
-		svc:     &Service{},
-		status:  "未启动",
-		saveDir: dir,
-	}
-	s.svc.saveDir = dir
-	s.svc.statusFn = s.setStatus
+	s := &State{status: "未启动", saveDir: dir}
+	s.svc = proxy.New(dir, s.setStatus)
 	return s
 }
 
-func (s *appState) setStatus(msg string) {
+func (s *State) Stop() {
+	s.svc.Stop()
+}
+
+func (s *State) setStatus(msg string) {
 	s.mu.Lock()
 	s.status = msg
 	s.mu.Unlock()
 }
 
-func (s *appState) setSaveDir(dir string) {
+func (s *State) setSaveDir(dir string) {
 	s.mu.Lock()
 	s.saveDir = dir
 	s.mu.Unlock()
-	s.svc.setSaveDir(dir)
+	s.svc.SetSaveDir(dir)
 }
 
-func (s *appState) snapshot() (status, dir string, running, starting bool) {
+func (s *State) snapshot() (status, dir string, running, starting bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.status, s.saveDir, s.running, s.starting
 }
 
-func (s *appState) toggle() {
+func (s *State) toggle() {
 	s.mu.Lock()
 	if s.starting {
 		s.mu.Unlock()
 		return
 	}
 	if s.running {
-		s.mu.Unlock()
-		s.mu.Lock()
 		s.status = "正在停止…"
 		s.mu.Unlock()
 		go func() {
@@ -93,7 +91,7 @@ func (s *appState) toggle() {
 	}()
 }
 
-func (s *appState) view(c *ui.Context) {
+func (s *State) View(c *ui.Context) {
 	status, dir, running, starting := s.snapshot()
 	t := c.Theme()
 
@@ -134,28 +132,5 @@ func (s *appState) view(c *ui.Context) {
 	s.mu.Unlock()
 	if pulse {
 		c.Invalidate()
-	}
-}
-
-func main() {
-	if len(os.Args) == 3 && os.Args[1] == "--watchdog" {
-		runWatchdog(os.Args[2])
-		return
-	}
-	mygo.App.SetName("视频号视频下载")
-	state := newAppState()
-	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { state.svc.Stop() })
-	defer state.svc.Stop()
-
-	mygo.App.WhenReady(func() {
-		mygo.NewWindow(mygo.WindowOptions{
-			Title:   "视频号视频下载",
-			Width:   560,
-			Height:  300,
-			Content: ui.View(state.view),
-		})
-	})
-	if err := mygo.App.Run(); err != nil {
-		log.Fatal(err)
 	}
 }

@@ -7,6 +7,7 @@
   "publisher": "sphvideo contributors",
   "license": "MIT",
   "icon": "resources/icon.png",
+  "main": "./cmd/sphvideo",
   "out": "build",
   "i18n": {
     "dir": "locales",

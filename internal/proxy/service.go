@@ -1,9 +1,10 @@
 //go:build windows
 
-package main
+package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,9 @@ import (
 	"time"
 
 	"github.com/ltaoo/echo"
+
+	"sphvideo/internal/download"
+	"sphvideo/internal/inject"
 )
 
 const defaultPort = 20230
@@ -27,13 +31,13 @@ type Service struct {
 	wdIn     io.WriteCloser
 
 	proxySnapshot *proxySnapshot
-	certPEM       []byte
-	keyPEM        []byte
-	certDER       []byte
 	version       string
+	saveDir       string
+	statusFn      func(string)
+}
 
-	saveDir  string
-	statusFn func(string)
+func New(saveDir string, status func(string)) *Service {
+	return &Service{saveDir: saveDir, statusFn: status}
 }
 
 func (s *Service) setStatus(msg string) {
@@ -45,16 +49,10 @@ func (s *Service) setStatus(msg string) {
 	}
 }
 
-func (s *Service) setSaveDir(dir string) {
+func (s *Service) SetSaveDir(dir string) {
 	s.mu.Lock()
 	s.saveDir = dir
 	s.mu.Unlock()
-}
-
-func (s *Service) Running() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.running
 }
 
 func (s *Service) Start() error {
@@ -78,9 +76,7 @@ func (s *Service) Start() error {
 		ln.Close()
 		return fmt.Errorf("生成临时证书失败: %w", err)
 	}
-	if err := removeCA(); err != nil {
-		// Best effort: an old copy is harmless.
-	}
+	_ = removeCA()
 	if err := installCA(der); err != nil {
 		ln.Close()
 		return fmt.Errorf("安装临时证书失败: %w", err)
@@ -108,7 +104,6 @@ func (s *Service) Start() error {
 	s.version = fmt.Sprintf("%d", time.Now().Unix())
 	s.echo = e
 	s.proxySnapshot = snap
-	s.certPEM, s.keyPEM, s.certDER = certPEM, keyPEM, der
 	s.listener = ln
 	s.mu.Unlock()
 
@@ -202,7 +197,7 @@ func (s *Service) channelsPlugin() *echo.Plugin {
 			s.mu.Lock()
 			port, version := s.port, s.version
 			s.mu.Unlock()
-			ctx.SetResponseBody(injectHTML(body, port, version))
+			ctx.SetResponseBody(inject.HTML(body, port, version))
 		},
 	}
 }
@@ -223,18 +218,60 @@ func (s *Service) resPlugin() *echo.Plugin {
 			version := s.version
 			s.mu.Unlock()
 			if strings.Contains(path, "virtual_svg-icons-register.publish") {
-				body = patchChannelsJS(body, version)
+				body = inject.ChannelsJS(body, version)
 			} else {
-				body = patchImports(body, version)
+				body = inject.Imports(body, version)
 			}
 			ctx.SetResponseBody(body)
 		},
 	}
 }
 
-func patchImports(js, version string) string {
-	js = reJSFrom.ReplaceAllString(js, `from"$1.js?v=`+version+`"`)
-	js = reJSDependency.ReplaceAllString(js, `"js/$1.js?v=`+version+`"`)
-	js = reJSLazy.ReplaceAllString(js, `import("$1.js?v=`+version+`")`)
-	return reJSImport.ReplaceAllString(js, `import"$1.js?v=`+version+`"`)
+type downloadResponse struct {
+	OK    bool   `json:"ok"`
+	Path  string `json:"path,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func cors(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	h.Set("Access-Control-Allow-Headers", "Content-Type")
+	h.Set("Access-Control-Allow-Private-Network", "true")
+	h.Set("Access-Control-Max-Age", "600")
+}
+
+func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
+	cors(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, downloadResponse{Error: "POST only"})
+		return
+	}
+	var req download.Request
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, downloadResponse{Error: "bad request"})
+		return
+	}
+	s.mu.Lock()
+	dir := s.saveDir
+	snap := s.proxySnapshot
+	s.mu.Unlock()
+	path, err := download.Save(req, dir, downloadProxy(snap), s.setStatus)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, downloadResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, downloadResponse{OK: true, Path: path})
 }
