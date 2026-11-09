@@ -217,6 +217,7 @@ func (d *StreamDriver) record_attempt(
 		return false, err
 	}
 	cmd := exec.CommandContext(process_ctx, d.ffmpeg_binary(), args...)
+	hide_process_window(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return false, fmt.Errorf("failed to create ffmpeg stdin pipe: %w", err)
@@ -765,6 +766,7 @@ func (d *StreamDriver) finalize_recording(
 		"-f", "matroska", "-y", tmp_output,
 	}
 	cmd := exec.CommandContext(ctx, d.ffmpeg_binary(), args...)
+	hide_process_window(cmd)
 	cmd.Dir = recording_dir
 	stderr := new_tail_buffer(stream_stderr_limit)
 	cmd.Stderr = stderr
@@ -847,6 +849,7 @@ func (d *StreamDriver) valid_stream_segments(ctx context.Context, recording_dir 
 			cmd := exec.CommandContext(ctx, ffprobe,
 				"-v", "error", "-show_entries", "stream=index", "-of", "csv=p=0", path,
 			)
+			hide_process_window(cmd)
 			if err := cmd.Run(); err != nil {
 				if context.Cause(ctx) != nil {
 					return nil, context.Cause(ctx)

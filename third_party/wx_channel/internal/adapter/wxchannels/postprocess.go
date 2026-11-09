@@ -2239,6 +2239,7 @@ func convert_mp3_node(values map[string]interface{}) (interface{}, error) {
 			"-y",
 			tmp_file,
 		)
+		hide_process_window(cmd)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			_ = os.Remove(tmp_file)
@@ -2308,6 +2309,7 @@ func stream_convert_node(values map[string]interface{}) (interface{}, error) {
 		tmp_file := mp4_file + ".converting"
 
 		cmd := exec.CommandContext(ctx, "ffmpeg", build_stream_mp4_args(input_file, tmp_file, video_codec, audio_codec)...)
+		hide_process_window(cmd)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			_ = os.Remove(tmp_file)
@@ -2332,6 +2334,7 @@ func probe_first_media_codec(ctx context.Context, input_file, selector string) (
 		"-of", "default=noprint_wrappers=1:nokey=1",
 		input_file,
 	)
+	hide_process_window(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe 失败: %w\n%s", err, string(output))
