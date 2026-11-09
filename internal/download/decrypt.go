@@ -2,12 +2,12 @@ package download
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
-	"os"
 )
 
 // Media files encrypt their first 128 KiB with an ISAAC64 keystream.
+
+const encryptedRegion = 128 * 1024
 
 type randCtx64 struct {
 	randCnt uint64
@@ -126,46 +126,38 @@ func mix(a, b, c, d, e, f, g, h *uint64) {
 	*g += *h
 }
 
-const encryptedRegion = 128 * 1024
-
-func decryptBytes(data []byte, key uint64) {
-	if len(data) == 0 || key == 0 {
-		return
-	}
-	limit := len(data)
-	if limit > encryptedRegion {
-		limit = encryptedRegion
-	}
-	ctx := newRandCtx64(key)
-	var block [8]byte
-	for i := 0; i < limit; i += 8 {
-		binary.BigEndian.PutUint64(block[:], ctx.next())
-		for j := 0; j < 8 && i+j < limit; j++ {
-			data[i+j] ^= block[j]
-		}
-	}
+type decryptReader struct {
+	r        io.Reader
+	ctx      *randCtx64
+	consumed uint64
+	ks       [8]byte
+	pos      int
 }
 
-func decryptFileInPlace(path string, key uint64) error {
+func DecryptingReader(r io.Reader, key uint64) io.Reader {
 	if key == 0 {
-		return nil
+		return r
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return err
+	return &decryptReader{r: r, ctx: newRandCtx64(key), pos: 8}
+}
+
+func (d *decryptReader) Read(p []byte) (int, error) {
+	n, err := d.r.Read(p)
+	if n <= 0 || d.consumed >= encryptedRegion {
+		return n, err
 	}
-	defer f.Close()
-	buf := make([]byte, encryptedRegion)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return fmt.Errorf("read encrypted head: %w", err)
+	to := uint64(n)
+	if left := encryptedRegion - d.consumed; to > left {
+		to = left
 	}
-	if n == 0 {
-		return nil
+	for i := uint64(0); i < to; i++ {
+		if d.pos >= 8 {
+			binary.BigEndian.PutUint64(d.ks[:], d.ctx.next())
+			d.pos = 0
+		}
+		p[i] ^= d.ks[d.pos]
+		d.pos++
 	}
-	decryptBytes(buf[:n], key)
-	if _, err := f.WriteAt(buf[:n], 0); err != nil {
-		return fmt.Errorf("write decrypted head: %w", err)
-	}
-	return nil
+	d.consumed += to
+	return n, err
 }

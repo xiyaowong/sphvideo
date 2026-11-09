@@ -1,5 +1,3 @@
-//go:build windows
-
 package proxy
 
 import (
@@ -71,22 +69,35 @@ func (s *Service) Start() error {
 	// A proxy pointing here at startup is left over from a crashed run.
 	clearStaleProxy(port)
 
+	snap, err := snapshotProxy()
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("读取系统代理失败: %w", err)
+	}
+	// Spawn cleanup before touching the certificate store, so a crash at any
+	// later point restores the proxy and removes the CA.
+	wd, err := spawnWatchdog(snap)
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("启动清理守护进程失败: %w", err)
+	}
+	stopWatchdog := func() {
+		_, _ = io.WriteString(wd, "done\n")
+		_ = wd.Close()
+	}
+
 	certPEM, keyPEM, der, err := generateCA()
 	if err != nil {
+		stopWatchdog()
 		ln.Close()
 		return fmt.Errorf("生成临时证书失败: %w", err)
 	}
 	_ = removeCA()
 	if err := installCA(der); err != nil {
+		_ = removeCA()
+		stopWatchdog()
 		ln.Close()
 		return fmt.Errorf("安装临时证书失败: %w", err)
-	}
-
-	snap, err := snapshotProxy()
-	if err != nil {
-		_ = removeCA()
-		ln.Close()
-		return fmt.Errorf("读取系统代理失败: %w", err)
 	}
 
 	e, err := echo.NewEchoWithOptions(certPEM, keyPEM, &echo.Options{
@@ -95,6 +106,7 @@ func (s *Service) Start() error {
 	})
 	if err != nil {
 		_ = removeCA()
+		stopWatchdog()
 		ln.Close()
 		return fmt.Errorf("启动代理失败: %w", err)
 	}
@@ -123,15 +135,17 @@ func (s *Service) Start() error {
 	s.mu.Unlock()
 
 	if err := setSystemProxy(port); err != nil {
-		server.Close()
+		snap.restore()
 		_ = removeCA()
+		stopWatchdog()
+		server.Close()
+		_ = ln.Close()
+		_ = e.Close()
 		return fmt.Errorf("设置系统代理失败: %w", err)
 	}
-	if wd, err := spawnWatchdog(snap); err == nil {
-		s.mu.Lock()
-		s.wdIn = wd
-		s.mu.Unlock()
-	}
+	s.mu.Lock()
+	s.wdIn = wd
+	s.mu.Unlock()
 	go func() {
 		_ = server.Serve(ln)
 	}()
@@ -173,9 +187,12 @@ func (s *Service) Stop() {
 	if e != nil {
 		_ = e.Close()
 	}
-	_ = removeCA()
+	caErr := removeCA()
 	if wd != nil {
-		_, _ = io.WriteString(wd, "done\n")
+		if caErr == nil {
+			_, _ = io.WriteString(wd, "done\n")
+		}
+		// On a failed CA removal, closing without "done" lets the watchdog retry.
 		_ = wd.Close()
 	}
 	s.setStatus("已停止，代理和证书已恢复")
@@ -217,11 +234,7 @@ func (s *Service) resPlugin() *echo.Plugin {
 			s.mu.Lock()
 			version := s.version
 			s.mu.Unlock()
-			if strings.Contains(path, "virtual_svg-icons-register.publish") {
-				body = inject.ChannelsJS(body, version)
-			} else {
-				body = inject.Imports(body, version)
-			}
+			body = inject.ChannelsJS(body, version)
 			ctx.SetResponseBody(body)
 		},
 	}
@@ -256,6 +269,10 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, downloadResponse{Error: "POST only"})
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && origin != "https://channels.weixin.qq.com" {
+		writeJSON(w, http.StatusForbidden, downloadResponse{Error: "forbidden"})
 		return
 	}
 	var req download.Request

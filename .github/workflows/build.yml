@@ -45,3 +45,55 @@ jobs:
           name: sphvideo-windows-installer
           path: dist/视频号视频下载-安装包.exe
           if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Linux binaries and packages
+        run: |
+          mkdir -p dist
+          go tool mygo build -platform linux/amd64,linux/arm64
+          cp build/linux-amd64/sphvideo dist/sphvideo-linux-amd64
+          cp build/linux-arm64/sphvideo dist/sphvideo-linux-arm64
+          cp build/linux-amd64/*.deb build/linux-amd64/*.tar.gz dist/
+          cp build/linux-arm64/*.deb build/linux-arm64/*.tar.gz dist/
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sphvideo-linux
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build macOS apps
+        run: |
+          mkdir -p dist
+          go tool mygo build -platform darwin/arm64,darwin/amd64 -skip-dmg -skip-notarize
+          tar -C build/darwin-arm64 -czf dist/sphvideo-macos-arm64.tar.gz sphvideo.app
+          tar -C build/darwin-amd64 -czf dist/sphvideo-macos-amd64.tar.gz sphvideo.app
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sphvideo-macos
+          path: dist/*
+          if-no-files-found: error

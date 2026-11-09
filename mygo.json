@@ -16,5 +16,9 @@
   "windows": {
     "displayName": "视频号视频下载",
     "installDirName": "SphVideo"
+  },
+  "linux": {
+    "webview": false,
+    "comment": "视频号视频下载"
   }
 }

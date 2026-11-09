@@ -1,33 +1,45 @@
 # sphvideo
 
-视频号视频下载工具，MyGo 原生界面。启动后，微信视频号页面右下角出现
-「下载视频」按钮，文件保存为 mp4。
+视频号下载工具，MyGo 原生界面。支持 Windows、macOS、Linux。
+
+## 功能
+
+- 视频：MP4，可选原始画质或界面列出的画质。
+- 音频：MP3，需要系统已安装 `ffmpeg`。
+- 封面：JPG。
+- 图片合集：ZIP；有背景音乐时一并保存。
 
 ## 使用
 
-1. 运行 `sphvideo.exe`，点「启动」。
-2. 打开微信 → 视频号 → 任意普通视频。
-3. 点右下角「下载视频」。默认保存到 `下载\视频号`。
+1. 运行应用，点「启动」。
+2. 打开微信 → 视频号 → 任意内容。
+3. 在右下角面板选择画质和下载项。默认保存到 `下载/视频号`。
+
+macOS 会请求确认证书信任。Linux 需要 GTK 3、`certutil`（libnss3-tools）、
+已有的 Chromium/Electron NSS 证书库和 GNOME/KDE 代理设置工具。macOS 构建
+未签名；若 Gatekeeper 拒绝，执行 `xattr -dr com.apple.quarantine sphvideo.app`。
 
 ## 原理
 
-本地 TLS 代理只拦截 `channels.weixin.qq.com` 和 `res.wx.qq.com`，向视频号
-页面注入按钮脚本，从视频号前端取得 `url + urlToken` 和 `decodeKey`。媒体
-文件前 128 KiB 使用 ISAAC64 密钥流加密，Go 端下载后解密保存。
+本地 TLS 代理只拦截 `channels.weixin.qq.com` 和 `res.wx.qq.com`，向页面
+注入脚本，从视频号前端取得 `url`、`urlToken`、`decodeKey`、画质列表、
+封面和图片。媒体文件前 128 KiB 使用 ISAAC64 密钥流加密；Go 端边下载边
+解密。MP3 由 `ffmpeg` 从解密后的数据流转换，不写临时文件。
 
 ## 清理
 
-- 除下载文件外，不写配置、日志、缓存、数据库或临时文件。
-- 一次性根证书只装入当前用户证书区，退出时由 Crypt32 静默删除。
+- 除下载文件外，不写配置、日志、缓存或临时文件。
+- 根证书：Windows 当前用户证书区；macOS 登录钥匙串；Linux `~/.pki/nssdb`。
+  退出时删除；异常退出由 watchdog 删除。
 - 系统代理原值只保存在内存，退出时恢复；异常退出由 watchdog 恢复。
-- 不安装服务或驱动，不需要管理员权限。
+- Windows 不需要管理员权限；macOS 证书确认由系统弹出；Linux 不需要 root。
 
 ## 目录
 
 - `cmd/sphvideo`：入口
 - `internal/app`：界面与状态
 - `internal/proxy`：代理、证书、系统代理
-- `internal/download`：下载与解密
+- `internal/download`：下载、解密与转换
 - `internal/inject`：页面与 JS 注入
 - `locales`、`resources`：安装器语言与应用图标
 
@@ -35,7 +47,7 @@
 
 ```powershell
 just build   # dist/sphvideo.exe
-just dist    # 二进制 + 中文安装包
+just dist    # Windows、Linux、macOS 产物
 ```
 
 ## 许可与免责声明

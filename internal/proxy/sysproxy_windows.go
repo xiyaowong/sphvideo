@@ -3,9 +3,8 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net"
-	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"syscall"
@@ -16,14 +15,16 @@ import (
 const inetSettings = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 
 type proxySnapshot struct {
-	enableSet   bool
-	enable      uint32
-	serverSet   bool
-	server      string
-	overrideSet bool
-	override    string
-	pacSet      bool
-	pac         string
+	enableSet     bool
+	enable        uint32
+	serverSet     bool
+	server        string
+	overrideSet   bool
+	override      string
+	pacSet        bool
+	pac           string
+	autoDetectSet bool
+	autoDetect    uint32
 }
 
 func openInetKey(access uint32) (registry.Key, error) {
@@ -51,6 +52,7 @@ func snapshotProxy() (*proxySnapshot, error) {
 	s.server, s.serverSet = readString(k, "ProxyServer")
 	s.override, s.overrideSet = readString(k, "ProxyOverride")
 	s.pac, s.pacSet = readString(k, "AutoConfigURL")
+	s.autoDetect, s.autoDetectSet = readDWORD(k, "AutoDetect")
 	return s, nil
 }
 
@@ -71,7 +73,7 @@ func pickProxyServer(v string) (string, string) {
 	if v == "" {
 		return "", ""
 	}
-	var fallback string
+	var bare string
 	for _, part := range strings.Split(v, ";") {
 		part = strings.TrimSpace(part)
 		if part == "" {
@@ -80,9 +82,6 @@ func pickProxyServer(v string) (string, string) {
 		if i := strings.Index(part, "="); i >= 0 {
 			scheme := strings.ToLower(strings.TrimSpace(part[:i]))
 			addr := strings.TrimSpace(part[i+1:])
-			if fallback == "" {
-				fallback = addr
-			}
 			if scheme == "http" || scheme == "https" {
 				if h, p := splitHostPort(addr); h != "" {
 					return h, p
@@ -90,11 +89,11 @@ func pickProxyServer(v string) (string, string) {
 			}
 			continue
 		}
-		if fallback == "" {
-			fallback = part
+		if bare == "" {
+			bare = part
 		}
 	}
-	return splitHostPort(fallback)
+	return splitHostPort(bare)
 }
 
 func splitHostPort(addr string) (string, string) {
@@ -126,6 +125,11 @@ func (s *proxySnapshot) restore() {
 	restoreString(k, "ProxyServer", s.server, s.serverSet)
 	restoreString(k, "ProxyOverride", s.override, s.overrideSet)
 	restoreString(k, "AutoConfigURL", s.pac, s.pacSet)
+	if s.autoDetectSet {
+		_ = k.SetDWordValue("AutoDetect", s.autoDetect)
+	} else {
+		_ = k.DeleteValue("AutoDetect")
+	}
 	notifyProxyChanged()
 }
 
@@ -157,8 +161,9 @@ func setSystemProxy(port int) error {
 	if err := k.SetStringValue("ProxyOverride", override); err != nil {
 		return err
 	}
-	// A PAC script would take precedence over our static proxy.
+	// A PAC script or WPAD would take precedence over our static proxy.
 	_ = k.DeleteValue("AutoConfigURL")
+	_ = k.SetDWordValue("AutoDetect", 0)
 	notifyProxyChanged()
 	return nil
 }
@@ -224,16 +229,39 @@ func notifyProxyChanged() {
 	}
 }
 
-// downloadProxy returns the transport proxy for direct downloads. Only plain
-// HTTP proxies are used; SOCKS is left to the TUN or system layer.
-func downloadProxy(s *proxySnapshot) func(*http.Request) (*url.URL, error) {
-	u := s.upstreamURL()
-	if u == "" {
-		return nil
+type watchdogState struct {
+	EnableSet     bool   `json:"e"`
+	Enable        uint32 `json:"ev"`
+	ServerSet     bool   `json:"s"`
+	Server        string `json:"sv"`
+	OverrideSet   bool   `json:"o"`
+	Override      string `json:"ov"`
+	PacSet        bool   `json:"p"`
+	Pac           string `json:"pv"`
+	AutoDetectSet bool   `json:"d"`
+	AutoDetect    uint32 `json:"dv"`
+}
+
+func (s *proxySnapshot) encode() ([]byte, error) {
+	return json.Marshal(watchdogState{
+		EnableSet: s.enableSet, Enable: s.enable,
+		ServerSet: s.serverSet, Server: s.server,
+		OverrideSet: s.overrideSet, Override: s.override,
+		PacSet: s.pacSet, Pac: s.pac,
+		AutoDetectSet: s.autoDetectSet, AutoDetect: s.autoDetect,
+	})
+}
+
+func decodeProxySnapshot(raw []byte) (*proxySnapshot, error) {
+	var st watchdogState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return nil, err
 	}
-	parsed, err := url.Parse(u)
-	if err != nil || parsed.Host == "" {
-		return nil
-	}
-	return func(*http.Request) (*url.URL, error) { return parsed, nil }
+	return &proxySnapshot{
+		enableSet: st.EnableSet, enable: st.Enable,
+		serverSet: st.ServerSet, server: st.Server,
+		overrideSet: st.OverrideSet, override: st.Override,
+		pacSet: st.PacSet, pac: st.Pac,
+		autoDetectSet: st.AutoDetectSet, autoDetect: st.AutoDetect,
+	}, nil
 }

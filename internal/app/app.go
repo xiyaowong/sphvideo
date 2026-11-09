@@ -117,7 +117,7 @@ func (s *State) View(c *ui.Context) {
 				}
 			}
 		})
-		ui.Text(c, "启动后打开微信 → 视频号 → 任意视频，右下角会出现下载按钮。").FontSize(11).TextColor(t.TextMuted)
+		ui.Text(c, "启动后打开微信 → 视频号 → 任意内容，右下角会出现下载面板。").FontSize(11).TextColor(t.TextMuted)
 	})
 
 	// Background start/stop changes state without an input event; pulse slowly
