@@ -26,9 +26,17 @@ The published method and parts of the injection/decryption logic were used
 as a reference. This project is not the upstream project, is not affiliated
 with its author, and is not endorsed by its author.
 
-The Commons Clause condition of the reference project applies to the
-reference software: it may not be sold. This project is free and
-non-commercial; it must not be sold.
+The reference project's license adds the Commons Clause condition:
+
+> Without limiting other conditions in the License, the grant of rights
+> under the License will not include, and the License does not grant to
+> you, the right to Sell the Software. For the purposes of the foregoing,
+> "Sell" means practicing any or all of the rights granted to you under
+> the License to provide to third parties, for a fee or other
+> consideration, a product or service whose value derives, entirely or
+> substantially, from the functionality of the Software.
+
+This project is free and non-commercial; it must not be sold.
 
 ## Icon
 
